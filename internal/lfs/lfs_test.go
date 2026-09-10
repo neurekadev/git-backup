@@ -99,6 +99,14 @@ type fakeLFSServer struct {
 	// failedPaths answer a status for one batch path only, so a test can model a
 	// candidate whose endpoint is broken while another answers.
 	failedPaths map[string]int
+	// requireAuth answers 401 to any request without an Authorization header,
+	// which is how a forge that wants credentials for the objects behaves.
+	requireAuth bool
+	// lapseFirstAction makes the first schedule for each object point at an
+	// already-expired URL, so the client has to ask for a fresh one.
+	lapseFirstAction bool
+	// scheduled counts how many times each object has been scheduled.
+	scheduled map[string]int
 	// fetchStatus, when non-zero, is the status batch requests get once a probe
 	// has been answered, so a test can model an endpoint that serves discovery
 	// and then stops serving the fetch.
@@ -109,7 +117,7 @@ type fakeLFSServer struct {
 
 func newFakeLFSServer(t *testing.T, data map[string][]byte) *fakeLFSServer {
 	t.Helper()
-	s := &fakeLFSServer{data: data, downloads: make(map[string]int)}
+	s := &fakeLFSServer{data: data, downloads: make(map[string]int), scheduled: make(map[string]int)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -194,6 +202,7 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 	probed := s.probeCalls > 0
 	fetchStatus := s.fetchStatus
 	failedPaths := s.failedPaths
+	requireAuth := s.requireAuth
 	disabled := slices.Contains(s.disabledPaths, r.URL.Path)
 	servedHere := slices.Contains(s.servePaths, r.URL.Path)
 	hasServePaths := len(s.servePaths) > 0
@@ -206,6 +215,12 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 	// when the test also mounts the service elsewhere.
 	if batchPath != "" && r.URL.Path != batchPath {
 		writeUnmounted(w)
+		return
+	}
+	if requireAuth && r.Header.Get("Authorization") == "" {
+		// The API wants credentials it was not given, which the client is
+		// expected to retry with.
+		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 	if disabled {
@@ -301,10 +316,20 @@ func (s *fakeLFSServer) respond(w http.ResponseWriter, request batchRequest) {
 			})
 			continue
 		}
+		action := &batchAction{Href: s.server.URL + "/download/" + object.OID}
+		s.mu.Lock()
+		s.scheduled[object.OID]++
+		lapse := s.lapseFirstAction && s.scheduled[object.OID] == 1
+		s.mu.Unlock()
+		if lapse {
+			// A URL that has already lapsed, as a server issuing a short-lived
+			// one before a slow scan would produce.
+			action.ExpiresAt = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		}
 		response.Objects = append(response.Objects, batchResponseObject{
 			OID:     object.OID,
 			Size:    int64(len(content)),
-			Actions: map[string]*batchAction{"download": {Href: s.server.URL + "/download/" + object.OID}},
+			Actions: map[string]*batchAction{"download": action},
 		})
 	}
 	w.Header().Set("Content-Type", lfsMediaType)
@@ -564,6 +589,67 @@ func TestFetchAllGuessFailureDoesNotOverruleTheConfiguredPath(t *testing.T) {
 	err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.plainRemoteURL(), "", "")
 	if !errors.Is(err, ErrDisabled) {
 		t.Fatalf("err = %v, want the configured path's disabled verdict to be the expected skip", err)
+	}
+}
+
+// TestFetchAllRetriesWithCredentialsOnUnauthorized covers a forge that answers
+// 401 when credentials were not presented — which the batch API documents as
+// "credentials are needed, but were not sent" — so the client repeats the request
+// with them rather than failing a repository it could have read.
+func TestFetchAllRetriesWithCredentialsOnUnauthorized(t *testing.T) {
+	content := []byte("content")
+	oid, pointerText := pointerFor(content)
+
+	lfsServer := newFakeLFSServer(t, map[string][]byte{oid: content})
+	lfsServer.requireAuth = true
+	repositoryPath := newRepoWithLFS(t, map[string]string{"file.bin": pointerText})
+
+	if err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.remoteURL(), "user", "token"); err != nil {
+		t.Fatalf("FetchAll failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repositoryPath, ".git", "lfs", "objects",
+		oid[0:2], oid[2:4], oid)); err != nil {
+		t.Errorf("the object should be mirrored after the authenticated retry: %v", err)
+	}
+
+	// Without credentials there is nothing to retry with, so the 401 stands.
+	unauthenticated := newRepoWithLFS(t, map[string]string{"file.bin": pointerText})
+	err := NewFetcher().FetchAll(context.Background(), unauthenticated, lfsServer.remoteURL(), "", "")
+	if err == nil {
+		t.Fatal("a 401 with no credentials to offer should be reported")
+	}
+	if errors.Is(err, ErrDisabled) {
+		t.Errorf("err = %v, want a failure rather than a repository recorded as LFS-free", err)
+	}
+}
+
+// TestFetchAllAsksAgainWhenTheDownloadURLLapsed covers a server that schedules a
+// URL which has already expired: the object needs a fresh one rather than a
+// transfer that can only fail, and the server is the only party that can issue it.
+func TestFetchAllAsksAgainWhenTheDownloadURLLapsed(t *testing.T) {
+	content := []byte("content")
+	oid, pointerText := pointerFor(content)
+
+	lfsServer := newFakeLFSServer(t, map[string][]byte{oid: content})
+	lfsServer.lapseFirstAction = true
+	repositoryPath := newRepoWithLFS(t, map[string]string{"file.bin": pointerText})
+
+	if err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.remoteURL(), "", ""); err != nil {
+		t.Fatalf("FetchAll failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repositoryPath, ".git", "lfs", "objects",
+		oid[0:2], oid[2:4], oid)); err != nil {
+		t.Errorf("the object should be mirrored after the URL was refreshed: %v", err)
+	}
+
+	lfsServer.mu.Lock()
+	schedules := lfsServer.scheduled[oid]
+	lfsServer.mu.Unlock()
+	if schedules != 2 {
+		t.Errorf("object was scheduled %d times, want it asked about again after the lapsed URL", schedules)
+	}
+	if downloads := lfsServer.downloadCount(oid); downloads != 1 {
+		t.Errorf("download count = %d, want the object streamed exactly once", downloads)
 	}
 }
 

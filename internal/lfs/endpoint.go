@@ -116,12 +116,12 @@ func endpointCandidates(repository *git.Repository, parsed *url.URL) ([]endpoint
 func (f *Fetcher) selectEndpoint(
 	ctx context.Context,
 	candidates []endpointCandidate,
-	username, password string,
+	creds credentials,
 	first pointer,
 ) (string, error) {
 	var configured, derived error
 	for _, candidate := range candidates {
-		switch err := f.client.probe(ctx, candidate.url, username, password, first); {
+		switch err := f.client.probe(ctx, candidate.url, creds, first); {
 		case err == nil:
 			slog.Debug("Git LFS API answered.", "endpoint", redactedURL(candidate.url))
 			return candidate.url, nil

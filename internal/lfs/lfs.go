@@ -72,13 +72,14 @@ func (f *Fetcher) FetchAll(ctx context.Context, repositoryPath, remoteURL, usern
 	if err != nil {
 		return err
 	}
-	endpoint, err := f.selectEndpoint(ctx, candidates, username, password, pointers[0])
+	creds := credentials{username: username, password: password}
+	endpoint, err := f.selectEndpoint(ctx, candidates, creds, pointers[0])
 	if err != nil {
 		return err
 	}
 
 	store := objectStoreDir(repository, repositoryPath)
-	outcome, err := f.fetchBatches(ctx, store, endpoint, username, password, pointers)
+	outcome, err := f.fetchBatches(ctx, store, endpoint, creds, pointers)
 	if err != nil {
 		return err
 	}
@@ -168,7 +169,8 @@ var ErrNoEndpoint = errors.New("no git lfs service answered at the endpoint")
 // repository.
 func (f *Fetcher) fetchBatches(
 	ctx context.Context,
-	store, endpoint, username, password string,
+	store, endpoint string,
+	creds credentials,
 	pointers []pointer,
 ) (chunkOutcome, error) {
 	var total chunkOutcome
@@ -179,7 +181,7 @@ func (f *Fetcher) fetchBatches(
 			return total, err
 		}
 
-		outcome, err := f.fetchChunk(ctx, store, endpoint, username, password, pointers[start:end])
+		outcome, err := f.fetchChunk(ctx, store, endpoint, creds, pointers[start:end])
 		total.absorb(outcome)
 		if err == nil {
 			continue
@@ -236,12 +238,13 @@ var errAllRejected = errors.New("every request for this batch was rejected")
 // object alone instead of the chunk's whole LFS content.
 func (f *Fetcher) fetchChunk(
 	ctx context.Context,
-	store, endpoint, username, password string,
+	store, endpoint string,
+	creds credentials,
 	pointers []pointer,
 ) (chunkOutcome, error) {
-	objects, err := f.client.batch(ctx, endpoint, username, password, pointers)
+	objects, err := f.client.batch(ctx, creds, endpoint, pointers)
 	if err == nil {
-		return f.downloadChunk(ctx, store, endpoint, username, password, objects)
+		return f.downloadChunk(ctx, store, endpoint, creds, objects)
 	}
 	if !errors.Is(err, errBatchRejected) {
 		return chunkOutcome{}, err
@@ -256,15 +259,15 @@ func (f *Fetcher) fetchChunk(
 	// makes the chunk's outcome complete whichever half went wrong.
 	if len(pointers) > 1 {
 		middle := len(pointers) / 2
-		outcome, firstErr := f.fetchChunk(ctx, store, endpoint, username, password, pointers[:middle])
+		outcome, firstErr := f.fetchChunk(ctx, store, endpoint, creds, pointers[:middle])
 		if firstErr != nil && !isRefusal(firstErr) {
 			// A half that failed outright still must not cost its sibling.
-			rest, _ := f.fetchChunk(ctx, store, endpoint, username, password, pointers[middle:])
+			rest, _ := f.fetchChunk(ctx, store, endpoint, creds, pointers[middle:])
 			outcome.absorb(rest)
 			return outcome, firstErr
 		}
 
-		rest, restErr := f.fetchChunk(ctx, store, endpoint, username, password, pointers[middle:])
+		rest, restErr := f.fetchChunk(ctx, store, endpoint, creds, pointers[middle:])
 		outcome.absorb(rest)
 		if restErr != nil && !isRefusal(restErr) {
 			return outcome, restErr
@@ -321,14 +324,40 @@ func refuseOrReport(outcome chunkOutcome, rejection error) (chunkOutcome, error)
 // counts as answered when the endpoint replied with content for any scheduled
 // object, which is what tells a rejection beside real answers from one that
 // stands alone.
+//
+// Objects whose scheduled URL had already lapsed are asked about once more: the
+// server is the only party that can issue a fresh URL, and a lapsed one would
+// otherwise fail a transfer that was ready to succeed.
 func (f *Fetcher) downloadChunk(
 	ctx context.Context,
-	store, endpoint, username, password string,
+	store, endpoint string,
+	creds credentials,
 	objects []batchResponseObject,
 ) (chunkOutcome, error) {
-	unavailable, failed := downloadObjects(ctx, f.client, store, endpoint, username, password, objects)
+	expired, unavailable, failed := downloadObjects(ctx, f.client, store, endpoint, creds, objects)
 
 	var outcome chunkOutcome
+	if len(expired) > 0 {
+		rescheduled, err := f.client.batch(ctx, creds, endpoint, expired)
+		if err != nil {
+			// The fresh request failing is the fetch's problem to report, and
+			// the objects it covered count as unserved.
+			for range expired {
+				outcome.recordUnavailable(fmt.Errorf("%w: no fresh download URL was issued", errObjectUnavailable))
+			}
+			failed = append(failed, err)
+		} else {
+			againExpired, againUnavailable, againFailed := downloadObjects(ctx, f.client, store, endpoint, creds, rescheduled)
+			for range againExpired {
+				// A server issuing an already-lapsed URL twice has nothing more
+				// to offer for these objects.
+				outcome.recordUnavailable(fmt.Errorf("%w: the download URL lapsed before it could be used", errObjectUnavailable))
+			}
+			unavailable = append(unavailable, againUnavailable...)
+			failed = append(failed, againFailed...)
+		}
+	}
+
 	for _, object := range unavailable {
 		outcome.recordUnavailable(fmt.Errorf("%w: %s", errObjectUnavailable, object.Error()))
 	}

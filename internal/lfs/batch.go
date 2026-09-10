@@ -31,9 +31,25 @@ type batchRequest struct {
 
 // batchAction is one server-provided action, here the basic-transfer download
 // instruction with its (typically pre-signed) URL.
+//
+// The expiry fields matter to a long run: a pre-signed URL stops working once it
+// lapses, and the server is the only party that can issue a fresh one.
 type batchAction struct {
-	Href   string            `json:"href"`
-	Header map[string]string `json:"header"`
+	Href      string            `json:"href"`
+	Header    map[string]string `json:"header"`
+	ExpiresIn int64             `json:"expires_in"`
+	ExpiresAt string            `json:"expires_at"`
+}
+
+// expired reports whether the action's URL has already lapsed. A past ExpiresAt
+// is authoritative; otherwise the relative expiry is measured from now.
+func (a *batchAction) expired() bool {
+	if a.ExpiresAt != "" {
+		if at, err := time.Parse(time.RFC3339, a.ExpiresAt); err == nil {
+			return !at.After(time.Now())
+		}
+	}
+	return a.ExpiresIn < 0
 }
 
 // batchResponseObject is the server's verdict for one object; exactly one of
@@ -60,6 +76,12 @@ type batchResponse struct {
 // object's fault (the endpoint's object limit, a stale pointer) rather than the
 // whole batch's.
 var errBatchRejected = errors.New("batch request rejected by the endpoint")
+
+// errCredentialsNeeded marks a batch request the endpoint answered with 401,
+// which the batch API documents as "credentials are needed, but were not sent".
+// The request is repeated once with them when there are any to offer; when there
+// are none the error is reported to the caller with its status intact.
+var errCredentialsNeeded = errors.New("batch request needs credentials")
 
 // errObjectUnavailable reports that the endpoint answered the batch request but
 // will not serve one of the objects it named, so the object cannot be mirrored.
@@ -103,7 +125,19 @@ const lfsMediaType = "application/vnd.git-lfs+json"
 // refused probe is about the path rather than the request's shape. A nil return
 // therefore means the API root is right, and the object's own fate is the
 // fetch's business.
-func (c *batchClient) probe(ctx context.Context, endpoint, username, password string, object pointer) error {
+// A 401 is answered by repeating the probe once with the credentials, as the
+// batch API documents, because a forge may serve an unauthenticated probe and
+// still require credentials for the objects themselves.
+func (c *batchClient) probe(ctx context.Context, endpoint string, creds credentials, object pointer) error {
+	err := c.doProbe(ctx, endpoint, creds, object, false)
+	if !errors.Is(err, errCredentialsNeeded) || !creds.available() {
+		return err
+	}
+	return c.doProbe(ctx, endpoint, creds, object, true)
+}
+
+// doProbe performs one probe request, optionally offering the credentials.
+func (c *batchClient) doProbe(ctx context.Context, endpoint string, creds credentials, object pointer, sendCredentials bool) error {
 	body, err := json.Marshal(batchRequest{
 		Operation: "download",
 		Transfers: []string{"basic"},
@@ -119,8 +153,8 @@ func (c *batchClient) probe(ctx context.Context, endpoint, username, password st
 	}
 	request.Header.Set("Content-Type", lfsMediaType)
 	request.Header.Set("Accept", lfsMediaType)
-	if username != "" || password != "" {
-		request.SetBasicAuth(username, password)
+	if sendCredentials {
+		request.SetBasicAuth(creds.username, creds.password)
 	}
 
 	response, err := c.client.Do(request)
@@ -134,6 +168,12 @@ func (c *batchClient) probe(ctx context.Context, endpoint, username, password st
 		// The API answered for the object, whether by scheduling it or by
 		// reporting that the server does not have it.
 		return nil
+	case http.StatusUnauthorized:
+		// The API wants credentials it was not given; the caller repeats the
+		// probe with them when there are any to offer. With none to offer the
+		// status is reported like any other failure, because that is what
+		// happened: the endpoint refused the request it was sent.
+		return fmt.Errorf("%w: batch request failed with status %d", errCredentialsNeeded, response.StatusCode)
 	case http.StatusForbidden:
 		// Two different things answer 403: a forge saying LFS is switched off
 		// for this repository, and a host page refusing a path it does not
@@ -172,6 +212,21 @@ func classifyRefusal(response *http.Response, verdict error) error {
 	return verdict
 }
 
+// credentials are the HTTP basic-auth pair the remote's own API accepts. They
+// travel as a value rather than as raw strings because a client may need to
+// offer them more than once: the batch API answers 401 when credentials are
+// needed but were not sent, and the request is then retried once with them.
+type credentials struct {
+	username string
+	password string
+}
+
+// available reports whether there is anything to offer. A request with no
+// credentials is never retried, because retrying would send the same request.
+func (c credentials) available() bool {
+	return c.username != "" || c.password != ""
+}
+
 // batch submits every pointer for download scheduling.
 //
 // A status describing the request's shape is reported as errBatchRejected so
@@ -180,49 +235,72 @@ func classifyRefusal(response *http.Response, verdict error) error {
 // chunk would only repeat the same answer more slowly. Discovery already
 // established which endpoint serves the API, so a 403 or 404 here describes a
 // service that has stopped answering rather than a path worth retrying.
-func (c *batchClient) batch(ctx context.Context, endpoint, username, password string, pointers []pointer) ([]batchResponseObject, error) {
+//
+// A 401 means the credentials were needed but not presented — a forge may accept
+// an unauthenticated probe and then require credentials for the objects — so the
+// request is repeated once with them, as the batch API documents, rather than
+// failing a repository that the client could have read.
+func (c *batchClient) batch(ctx context.Context, creds credentials, endpoint string, pointers []pointer) ([]batchResponseObject, error) {
+	objects, attempted, err := c.doBatch(ctx, creds, endpoint, pointers, false)
+	if attempted || !errors.Is(err, errCredentialsNeeded) || !creds.available() {
+		return objects, err
+	}
+	objects, _, err = c.doBatch(ctx, creds, endpoint, pointers, true)
+	return objects, err
+}
+
+// doBatch performs one batch request, optionally offering the credentials.
+func (c *batchClient) doBatch(
+	ctx context.Context,
+	creds credentials,
+	endpoint string,
+	pointers []pointer,
+	sendCredentials bool,
+) ([]batchResponseObject, bool, error) {
 	body, err := json.Marshal(batchRequest{
 		Operation: "download",
 		Transfers: []string{"basic"},
 		Objects:   toBatchObjects(pointers),
 	})
 	if err != nil {
-		return nil, err
+		return nil, sendCredentials, err
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/objects/batch", bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, sendCredentials, err
 	}
 	request.Header.Set("Content-Type", lfsMediaType)
 	request.Header.Set("Accept", lfsMediaType)
-	if username != "" || password != "" {
-		request.SetBasicAuth(username, password)
+	if sendCredentials {
+		request.SetBasicAuth(creds.username, creds.password)
 	}
 
 	response, err := c.client.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("batch request: %w", err)
+		return nil, sendCredentials, fmt.Errorf("batch request: %w", err)
 	}
 	defer drainAndClose(response)
 
 	switch {
 	case response.StatusCode == http.StatusOK:
 		// Handled below.
+	case response.StatusCode == http.StatusUnauthorized:
+		return nil, sendCredentials, fmt.Errorf("%w: batch request failed with status %d", errCredentialsNeeded, response.StatusCode)
 	case describesRequestShape(response.StatusCode):
-		return nil, fmt.Errorf("%w: status %d", errBatchRejected, response.StatusCode)
+		return nil, sendCredentials, fmt.Errorf("%w: status %d", errBatchRejected, response.StatusCode)
 	default:
-		return nil, fmt.Errorf("batch request failed with status %d", response.StatusCode)
+		return nil, sendCredentials, fmt.Errorf("batch request failed with status %d", response.StatusCode)
 	}
 
 	var decoded batchResponse
 	if err := json.NewDecoder(io.LimitReader(response.Body, 512<<20)).Decode(&decoded); err != nil {
-		return nil, fmt.Errorf("decode batch response: %w", err)
+		return nil, sendCredentials, fmt.Errorf("decode batch response: %w", err)
 	}
 	if len(decoded.Objects) != len(pointers) {
-		return nil, fmt.Errorf("batch response has %d objects for %d pointers", len(decoded.Objects), len(pointers))
+		return nil, sendCredentials, fmt.Errorf("batch response has %d objects for %d pointers", len(decoded.Objects), len(pointers))
 	}
-	return decoded.Objects, nil
+	return decoded.Objects, sendCredentials, nil
 }
 
 // describesRequestShape reports whether a status is how servers answer a request
@@ -256,18 +334,19 @@ func looksLikeHTML(body []byte) bool {
 // skipped, so repeated snapshots only download new content.
 //
 // Every object is attempted whatever the others did, so one bad pointer or one
-// transient transfer failure cannot hide its siblings. What failed comes back in
-// two lists: unavailable for objects the endpoint will not serve, and failed for
-// objects this client could not transfer — a corrupt body, a broken connection —
-// which the caller reports rather than recording as the endpoint's refusal. Both
-// lists are about objects the endpoint did not answer for with content; what it
-// answered for is what the caller counts as evidence that it processed the chunk.
+// transient transfer failure cannot hide its siblings. What could not be fetched
+// comes back in three lists: expired for objects whose scheduled URL had already
+// lapsed, which the caller asks the endpoint about again; unavailable for objects
+// the endpoint will not serve; and failed for objects this client could not
+// transfer — a corrupt body, a broken connection — which the caller reports
+// rather than recording as the endpoint's refusal.
 func downloadObjects(
 	ctx context.Context,
 	client *batchClient,
-	store, endpoint, username, password string,
+	store, endpoint string,
+	creds credentials,
 	objects []batchResponseObject,
-) (unavailable []*batchObjectError, failed []error) {
+) (expired []pointer, unavailable []*batchObjectError, failed []error) {
 	endpointHost := hostOf(endpoint)
 	answered := func(object batchResponseObject) *batchObjectError {
 		switch {
@@ -284,38 +363,46 @@ func downloadObjects(
 
 	for _, object := range objects {
 		if err := ctx.Err(); err != nil {
-			return unavailable, append(failed, err)
+			return expired, unavailable, append(failed, err)
 		}
 		if refused := answered(object); refused != nil {
 			unavailable = append(unavailable, refused)
 			continue
 		}
-		if _, err := downloadObject(ctx, client.client, store, endpointHost, username, password, object.OID, object.Actions["download"]); err != nil {
+		action := object.Actions["download"]
+		if action.expired() {
+			// The URL lapsed before it was used — a long scan, a slow batch, a
+			// small expires_in — so the object needs a fresh one rather than a
+			// transfer that can only fail.
+			expired = append(expired, pointer{oid: object.OID, size: object.Size})
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(store, object.OID[0:2], object.OID[2:4], object.OID)); err == nil {
+			// Already cached by a previous snapshot; git-lfs also skips it.
+			continue
+		}
+		if err := downloadObject(ctx, client.client, store, endpointHost, creds, object.OID, action); err != nil {
 			failed = append(failed, err)
 		}
 	}
-	return unavailable, failed
+	return expired, unavailable, failed
 }
 
 // downloadObject streams one object into the LFS cache, verifying its SHA-256 as
-// bytes arrive. It reports whether the object was already cached, so a caller can
-// tell an endpoint that streamed the bytes from one that merely answered for
-// them.
+// bytes arrive.
 func downloadObject(
 	ctx context.Context,
 	client *http.Client,
-	store, endpointHost, username, password, oid string,
+	store, endpointHost string,
+	creds credentials,
+	oid string,
 	action *batchAction,
-) (bool, error) {
+) error {
 	destination := filepath.Join(store, oid[0:2], oid[2:4], oid)
-	if _, err := os.Stat(destination); err == nil {
-		// Already cached by a previous snapshot; git-lfs also skips it.
-		return true, nil
-	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, action.Href, nil)
 	if err != nil {
-		return false, fmt.Errorf("LFS object %s: %w", shortOID(oid), err)
+		return fmt.Errorf("LFS object %s: %w", shortOID(oid), err)
 	}
 	for key, value := range action.Header {
 		request.Header.Set(key, value)
@@ -323,27 +410,27 @@ func downloadObject(
 	// Pre-signed download URLs carry their own authorization; the basic
 	// credential only applies while the request stays on the LFS endpoint's
 	// host.
-	if hostOf(action.Href) == endpointHost && (username != "" || password != "") {
-		request.SetBasicAuth(username, password)
+	if hostOf(action.Href) == endpointHost && creds.available() {
+		request.SetBasicAuth(creds.username, creds.password)
 	}
 
 	response, err := client.Do(request)
 	if err != nil {
-		return false, fmt.Errorf("LFS object %s: %w", shortOID(oid), err)
+		return fmt.Errorf("LFS object %s: %w", shortOID(oid), err)
 	}
 	defer drainAndClose(response)
 
 	if response.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("LFS object %s download failed with status %d", shortOID(oid), response.StatusCode)
+		return fmt.Errorf("LFS object %s download failed with status %d", shortOID(oid), response.StatusCode)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
-		return false, fmt.Errorf("create LFS cache directory: %w", err)
+		return fmt.Errorf("create LFS cache directory: %w", err)
 	}
 
 	temp, err := os.CreateTemp(filepath.Dir(destination), ".lfs-download-*")
 	if err != nil {
-		return false, fmt.Errorf("create LFS temp file: %w", err)
+		return fmt.Errorf("create LFS temp file: %w", err)
 	}
 	tempName := temp.Name()
 
@@ -352,24 +439,24 @@ func downloadObject(
 	closeErr := temp.Close()
 	if copyErr != nil {
 		_ = os.Remove(tempName)
-		return false, fmt.Errorf("LFS object %s: %w", shortOID(oid), copyErr)
+		return fmt.Errorf("LFS object %s: %w", shortOID(oid), copyErr)
 	}
 	if closeErr != nil {
 		_ = os.Remove(tempName)
-		return false, fmt.Errorf("LFS object %s: %w", shortOID(oid), closeErr)
+		return fmt.Errorf("LFS object %s: %w", shortOID(oid), closeErr)
 	}
 
 	if actual := hex.EncodeToString(hash.Sum(nil)); actual != oid {
 		_ = os.Remove(tempName)
-		return false, fmt.Errorf("LFS object %s content hash mismatch", shortOID(oid))
+		return fmt.Errorf("LFS object %s content hash mismatch", shortOID(oid))
 	}
 
 	if err := os.Rename(tempName, destination); err != nil {
 		_ = os.Remove(tempName)
-		return false, fmt.Errorf("store LFS object %s: %w", shortOID(oid), err)
+		return fmt.Errorf("store LFS object %s: %w", shortOID(oid), err)
 	}
 	_ = size
-	return false, nil
+	return nil
 }
 
 func toBatchObjects(pointers []pointer) []batchObject {
