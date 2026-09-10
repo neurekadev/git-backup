@@ -106,15 +106,20 @@ func (f *Fetcher) selectEndpoint(
 		}
 	}
 	switch {
-	case failed != nil:
-		// A real failure outranks "LFS is off for this repository", because the
-		// mirror layer records that verdict as a successful skip: preferring it
-		// would present a broken or unauthorized service as a complete mirror
-		// with no LFS content. Losing a disabled verdict to a wrong path's answer
-		// is the cheaper mistake — noisy, visible, and retryable.
-		return "", failed
 	case disabled != nil:
+		// A service that answered "LFS is off for this repository" identified
+		// the API root, and the mirror layer records that as an expected skip. A
+		// guess that is simply wrong for the host answering differently must not
+		// turn a repository with no LFS content to mirror into a failed backup.
+		if failed != nil {
+			// The failure still happened, so it is kept for the debug trail
+			// rather than discarded — it is just not what decides the fetch.
+			slog.Debug("A candidate path failed while another reported Git LFS disabled.",
+				"detail", redactedURL(failed.Error()))
+		}
 		return "", disabled
+	case failed != nil:
+		return "", failed
 	default:
 		// No candidate serves the API. The mirror layer records that as LFS
 		// being switched off rather than failing the repository, which is the

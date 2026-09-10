@@ -96,6 +96,9 @@ type fakeLFSServer struct {
 	// serveProbe answers discovery probes normally, so a test can have discovery
 	// succeed while the batch requests that follow are rejected.
 	serveProbe bool
+	// failedPaths answer a status for one batch path only, so a test can model a
+	// candidate whose endpoint is broken while another answers.
+	failedPaths map[string]int
 	// fetchStatus, when non-zero, is the status batch requests get once a probe
 	// has been answered, so a test can model an endpoint that serves discovery
 	// and then stops serving the fetch.
@@ -190,6 +193,7 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 	rejectWhen, serveProbe := s.rejectWhen, s.serveProbe
 	probed := s.probeCalls > 0
 	fetchStatus := s.fetchStatus
+	failedPaths := s.failedPaths
 	disabled := slices.Contains(s.disabledPaths, r.URL.Path)
 	servedHere := slices.Contains(s.servePaths, r.URL.Path)
 	hasServePaths := len(s.servePaths) > 0
@@ -209,6 +213,12 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", lfsMediaType)
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`{"message":"Git LFS is disabled for this repository."}`))
+		return
+	}
+	if failedStatus, fails := failedPaths[r.URL.Path]; fails {
+		// One candidate path fails while another answers, so a test can model a
+		// wrong guess that is not merely unmounted.
+		w.WriteHeader(failedStatus)
 		return
 	}
 	if hasServePaths && !servedHere {
@@ -510,6 +520,33 @@ func TestFetchAllNotServedAnywhereIsSkipped(t *testing.T) {
 	err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.plainRemoteURL(), "", "")
 	if !errors.Is(err, ErrDisabled) {
 		t.Fatalf("err = %v, want ErrDisabled when no candidate serves the API", err)
+	}
+}
+
+// TestFetchAllDisabledOutranksAWrongPathsFailure covers the mixed case: the
+// repository's own API root answers that LFS is switched off, while the other
+// candidate path fails outright. The expected skip must win, because a guess that
+// is wrong for the host must not turn a repository with no LFS content to mirror
+// into a failed backup — and the failure still has to be visible in the debug
+// trail rather than discarded.
+func TestFetchAllDisabledOutranksAWrongPathsFailure(t *testing.T) {
+	oid, pointerText := pointerFor([]byte("content"))
+
+	lfsServer := newFakeLFSServer(t, map[string][]byte{oid: []byte("content")})
+	// The suffixed path is the repository's own, and reports LFS off; the
+	// suffix-less path the remote configures is broken.
+	lfsServer.disabledFor(lfsServer.remoteURL())
+	lfsServer.failedPaths = map[string]int{
+		batchPathFor(lfsServer.plainRemoteURL()): http.StatusInternalServerError,
+	}
+	repositoryPath := newRepoWithLFS(t, map[string]string{"file.bin": pointerText})
+
+	err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.plainRemoteURL(), "", "")
+	if !errors.Is(err, ErrDisabled) {
+		t.Fatalf("err = %v, want the disabled verdict to be the expected skip", err)
+	}
+	if errors.Is(err, ErrNoEndpoint) {
+		t.Error("a wrong path's answer must not become the reason the repository is skipped")
 	}
 }
 
