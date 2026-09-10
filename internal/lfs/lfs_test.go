@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
@@ -70,6 +72,12 @@ type fakeLFSServer struct {
 	downloads  map[string]int
 	// batchStatus, when non-zero, is the status returned for batch requests.
 	batchStatus int
+	// refusedOIDs are answered with a per-object error instead of a download
+	// action, like a pointer whose object is gone from the server.
+	refusedOIDs []string
+	// rejectWhen, when set, decides the status of each batch request so a test
+	// can model an endpoint that rejects some request shapes.
+	rejectWhen func(batchRequest) int
 	// corruptDownload serves wrong bytes for every object.
 	corruptDownload bool
 	// batchPath overrides the expected batch path (lfs.url override tests).
@@ -104,6 +112,11 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.batchCalls++
 	status, batchPath := s.batchStatus, s.batchPath
+	rejectWhen := s.rejectWhen
+	refused := make(map[string]struct{}, len(s.refusedOIDs))
+	for _, oid := range s.refusedOIDs {
+		refused[oid] = struct{}{}
+	}
 	s.mu.Unlock()
 
 	if batchPath != "" && r.URL.Path != batchPath {
@@ -121,9 +134,26 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Mimic a forge that rejects some batch requests, such as one carrying more
+	// objects than its limit allows.
+	if rejectWhen != nil {
+		if code := rejectWhen(request); code != http.StatusOK {
+			w.WriteHeader(code)
+			return
+		}
+	}
+
 	response := batchResponse{Objects: make([]batchResponseObject, 0, len(request.Objects))}
 	for _, object := range request.Objects {
-		if _, known := s.data[object.OID]; !known {
+		if _, isRefused := refused[object.OID]; isRefused {
+			response.Objects = append(response.Objects, batchResponseObject{
+				OID:   object.OID,
+				Error: &batchError{Code: http.StatusUnprocessableEntity, Message: "refused"},
+			})
+			continue
+		}
+		content, known := s.data[object.OID]
+		if !known {
 			response.Objects = append(response.Objects, batchResponseObject{
 				OID:   object.OID,
 				Error: &batchError{Code: http.StatusNotFound, Message: "Object does not exist"},
@@ -132,7 +162,7 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		response.Objects = append(response.Objects, batchResponseObject{
 			OID:     object.OID,
-			Size:    int64(len(s.data[object.OID])),
+			Size:    int64(len(content)),
 			Actions: map[string]*batchAction{"download": {Href: s.server.URL + "/download/" + object.OID}},
 		})
 	}
@@ -319,6 +349,214 @@ func TestFetchAllUnknownObjectFails(t *testing.T) {
 	if err == nil || errors.Is(err, ErrDisabled) {
 		t.Fatalf("unknown object should be a genuine error, got %v", err)
 	}
+	if !errors.Is(err, errObjectUnavailable) {
+		t.Fatalf("err = %v, want it to report the object as unavailable", err)
+	}
+	if !strings.Contains(err.Error(), "could not be fetched") {
+		t.Fatalf("err = %v, want it to say how many objects were skipped", err)
+	}
+}
+
+// TestFetchAllFallsBackWhenBatchRejected covers forges that reject a batch
+// request outright — an object limit, or a batch they refuse to process. The
+// pointers must be retried one at a time so a single refused object cannot cost
+// the repository's whole LFS mirror, while a refusal that hits every object is
+// reported as the endpoint's failure.
+func TestFetchAllFallsBackWhenBatchRejected(t *testing.T) {
+	available := []byte("available content")
+	availableOID, availablePointer := pointerFor(available)
+	refused := []byte("refused content")
+	refusedOID, refusedPointer := pointerFor(refused)
+	result := func(oids ...string) string { return strings.Join(oids, ",") }
+
+	cases := []struct {
+		name        string
+		request     func(batchRequest) int
+		wantErr     string
+		wantBatches int
+		wantCached  string
+	}{
+		{
+			name: "server object limit",
+			request: func(request batchRequest) int {
+				if len(request.Objects) > 1 {
+					return http.StatusUnprocessableEntity
+				}
+				return http.StatusOK
+			},
+			wantBatches: 3,
+			wantCached:  result(availableOID, refusedOID),
+		},
+		{
+			name: "one object rejected, one refused",
+			request: func(request batchRequest) int {
+				for _, object := range request.Objects {
+					if object.OID == refusedOID {
+						return http.StatusUnprocessableEntity
+					}
+				}
+				return http.StatusOK
+			},
+			wantErr:     "unavailable",
+			wantBatches: 3,
+			wantCached:  result(availableOID),
+		},
+		{
+			name: "the endpoint refuses every batch",
+			request: func(batchRequest) int {
+				return http.StatusBadRequest
+			},
+			wantErr:     "rejected for 2 of 2 objects",
+			wantBatches: 3,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			lfsServer := newFakeLFSServer(t, map[string][]byte{
+				availableOID: available,
+				refusedOID:   refused,
+			})
+			lfsServer.rejectWhen = c.request
+			repositoryPath := newRepoWithLFS(t, map[string]string{
+				"big.bin":   availablePointer,
+				"stale.bin": refusedPointer,
+			})
+
+			err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.remoteURL(), "", "")
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("FetchAll = %v, want success", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("FetchAll = %v, want an error containing %q", err, c.wantErr)
+			}
+
+			if calls := lfsServer.batchCallCount(); calls != c.wantBatches {
+				t.Errorf("batch calls = %d, want %d", calls, c.wantBatches)
+			}
+			for _, oid := range strings.Split(c.wantCached, ",") {
+				if oid == "" {
+					continue
+				}
+				path := filepath.Join(repositoryPath, ".git", "lfs", "objects", oid[0:2], oid[2:4], oid)
+				if _, err := os.Stat(path); err != nil {
+					t.Errorf("object %s should be mirrored: %v", shortOID(oid), err)
+				}
+			}
+		})
+	}
+}
+
+func TestFetchAllChunksLargePointerSets(t *testing.T) {
+	files := make(map[string]string, batchObjectLimit+2)
+	data := make(map[string][]byte, batchObjectLimit+2)
+	var lastOID string
+	for index := range batchObjectLimit + 2 {
+		content := []byte(fmt.Sprintf("object %d", index))
+		oid, pointerText := pointerFor(content)
+		data[oid] = content
+		files[fmt.Sprintf("file-%03d.bin", index)] = pointerText
+		lastOID = oid
+	}
+
+	lfsServer := newFakeLFSServer(t, data)
+	repositoryPath := newRepoWithLFS(t, files)
+
+	if err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.remoteURL(), "", ""); err != nil {
+		t.Fatalf("FetchAll failed: %v", err)
+	}
+
+	if calls := lfsServer.batchCallCount(); calls != 2 {
+		t.Errorf("batch calls = %d, want one request per chunk of %d", calls, batchObjectLimit)
+	}
+	if _, err := os.Stat(filepath.Join(repositoryPath, ".git", "lfs", "objects",
+		lastOID[0:2], lastOID[2:4], lastOID)); err != nil {
+		t.Errorf("the last chunk should be mirrored too: %v", err)
+	}
+}
+
+// TestCollectPointersHandlesWindowsIllegalNames covers a tree entry that cannot
+// be materialised on the host — a backslash in a name is a path separator on
+// Windows — and one that reuses a subtree hash, as a submodule-like entry does.
+// Both must be walked without tripping the scan: the pointer beside them is
+// still collected, and the shared tree is visited once.
+func TestCollectPointersHandlesWindowsIllegalNames(t *testing.T) {
+	dir := t.TempDir()
+	repository, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := repository.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	content := []byte("weights")
+	oid, pointerText := pointerFor(content)
+	if err := os.MkdirAll(filepath.Join(dir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "nested", "weights.bin"), []byte(pointerText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worktree.Add("nested/weights.bin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worktree.Commit("add pointer", &git.CommitOptions{
+		Author: &object.Signature{Name: "test", Email: "test@example.com", When: time.Now()},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	head, err := repository.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := repository.CommitObject(head.Hash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := repository.TreeObject(commit.TreeHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nested object.TreeEntry
+	for _, entry := range root.Entries {
+		if entry.Name == "nested" {
+			nested = entry
+		}
+	}
+	if nested.Hash.IsZero() {
+		t.Fatal("nested subtree not found")
+	}
+
+	hostile := &object.Tree{Entries: []object.TreeEntry{
+		{Name: "nested-again", Hash: nested.Hash, Mode: filemode.Dir},
+		{Name: "nested", Hash: nested.Hash, Mode: filemode.Dir},
+		{Name: `src\windows.cpp`, Hash: plumbing.NewHash(strings.Repeat("a", 40)), Mode: filemode.Regular},
+	}}
+	encoded := repository.Storer.NewEncodedObject()
+	if err := hostile.Encode(encoded); err != nil {
+		t.Fatal(err)
+	}
+	hostileHash, err := repository.Storer.SetEncodedObject(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	headRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName("hostile"), hostileHash)
+	if err := repository.Storer.SetReference(headRef); err != nil {
+		t.Fatal(err)
+	}
+
+	pointers, err := collectPointers(context.Background(), repository)
+	if err != nil {
+		t.Fatalf("collectPointers failed on a tree with host-specific names: %v", err)
+	}
+	if len(pointers) != 1 || pointers[0].oid != oid {
+		t.Fatalf("pointers = %+v, want the single pointer %s", pointers, oid)
+	}
 }
 
 func TestFetchAllRejectsUnsafeLFSConfigOverrides(t *testing.T) {
@@ -376,6 +614,33 @@ func TestCanonicalHostStripsSchemeDefaultPorts(t *testing.T) {
 	}
 	if canonicalHost(mustParse("https://example.com:8443/lfs")) == canonicalHost(mustParse("https://example.com/lfs")) {
 		t.Error("a non-default port must stay distinct from the bare host")
+	}
+}
+
+// TestDefaultEndpointAddsGitSuffix pins the endpoint a forge expects: GitHub
+// and GitLab answer a suffix-less /info/lfs with 422, so a configured remote
+// without .git still has to request the suffixed path.
+func TestDefaultEndpointAddsGitSuffix(t *testing.T) {
+	cases := []struct {
+		remoteURL string
+		want      string
+	}{
+		{"https://github.com/owner/repo", "https://github.com/owner/repo.git/info/lfs"},
+		{"https://github.com/owner/repo.git", "https://github.com/owner/repo.git/info/lfs"},
+		{"https://github.com/owner/repo/", "https://github.com/owner/repo.git/info/lfs"},
+		{"https://git.example.com:8443/group/sub/repo", "https://git.example.com:8443/group/sub/repo.git/info/lfs"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.remoteURL, func(t *testing.T) {
+			parsed, err := url.Parse(c.remoteURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := defaultEndpoint(parsed); got != c.want {
+				t.Errorf("defaultEndpoint(%q) = %q, want %q", c.remoteURL, got, c.want)
+			}
+		})
 	}
 }
 

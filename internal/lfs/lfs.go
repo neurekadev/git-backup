@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -66,13 +67,153 @@ func (f *Fetcher) FetchAll(ctx context.Context, repositoryPath, remoteURL, usern
 		return nil
 	}
 
-	objects, err := f.client.batch(ctx, endpoint, username, password, pointers)
-	if err != nil {
-		return err
+	store := objectStoreDir(repository, repositoryPath)
+	return f.fetchBatches(ctx, store, endpoint, username, password, pointers)
+}
+
+// batchObjectLimit is how many pointers one batch request submits. Git LFS
+// clients use the same limit; a forge may reject a request that exceeds its own
+// smaller limit, which fetchChunk then narrows down.
+const batchObjectLimit = 100
+
+// fetchBatches downloads every pointer's object, splitting the pointers into
+// batch requests. A batch the endpoint rejects is narrowed down object by
+// object, so one object the server will not serve — a stale pointer, or a
+// request the server considers too large — costs that object alone instead of
+// the repository's entire LFS mirror. Failing to mirror an object that exists
+// still errors the fetch.
+func (f *Fetcher) fetchBatches(
+	ctx context.Context,
+	store, endpoint, username, password string,
+	pointers []pointer,
+) error {
+	var unavailable, rejected int
+	var firstFailure, firstErr error
+	for start := 0; start < len(pointers); start += batchObjectLimit {
+		end := min(start+batchObjectLimit, len(pointers))
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		outcome, err := f.fetchChunk(ctx, store, endpoint, username, password, pointers[start:end])
+		unavailable += outcome.unavailable
+		rejected += outcome.rejected
+		if outcome.skipped != nil && firstFailure == nil {
+			firstFailure = outcome.skipped
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 
-	store := objectStoreDir(repository, repositoryPath)
-	return downloadObjects(ctx, f.client, store, endpoint, username, password, objects)
+	skipped := unavailable + rejected
+	if skipped > 0 {
+		// The mirrored repository stays usable, but its LFS content is not
+		// complete, so say so once per repository at warn level and keep the
+		// per-object reasons for debug output.
+		slog.Warn("Some Git LFS objects could not be fetched; the repository was mirrored without them.",
+			"endpoint", endpoint, "objectsMissing", skipped, "objectsRequested", len(pointers))
+		slog.Debug("Git LFS objects that could not be fetched.",
+			"endpoint", endpoint, "reason", firstFailure.Error())
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if skipped > 0 {
+		return fmt.Errorf("%d of %d LFS objects could not be fetched: %w", skipped, len(pointers), firstFailure)
+	}
+	return nil
+}
+
+// chunkOutcome reports what one batch request could not fetch: objects the
+// endpoint answered for but will not serve, and objects whose own batch request
+// the endpoint rejected outright. skipped, when set, names the first of them.
+type chunkOutcome struct {
+	unavailable int
+	rejected    int
+	skipped     error
+}
+
+// fetchChunk submits one batch request for pointers and downloads what it
+// schedules. A rejected batch falls back to requesting the same pointers
+// individually: the rejection is usually one poisonous object, and the remaining
+// objects then still reach the mirror. A rejection covering more than half of the
+// chunk comes back as an error, because a failure that broad is the endpoint's,
+// not one object's.
+func (f *Fetcher) fetchChunk(
+	ctx context.Context,
+	store, endpoint, username, password string,
+	pointers []pointer,
+) (chunkOutcome, error) {
+	objects, err := f.client.batch(ctx, endpoint, username, password, pointers)
+	if err == nil {
+		return f.downloadChunk(ctx, store, endpoint, username, password, objects)
+	}
+	if !errors.Is(err, errBatchRejected) {
+		return chunkOutcome{}, err
+	}
+
+	outcome := chunkOutcome{}
+	for index := range pointers {
+		if ctx.Err() != nil {
+			return outcome, ctx.Err()
+		}
+
+		single, err := f.client.batch(ctx, endpoint, username, password, pointers[index:index+1])
+		if err != nil {
+			if !errors.Is(err, errBatchRejected) {
+				return outcome, err
+			}
+			// This object's own request was rejected too, so the endpoint
+			// refuses to serve it at all.
+			outcome.rejected++
+			if outcome.skipped == nil {
+				outcome.skipped = fmt.Errorf("%w: LFS object %s download request rejected: %w", errObjectUnavailable, shortOID(pointers[index].oid), err)
+			}
+			continue
+		}
+
+		served, err := f.downloadChunk(ctx, store, endpoint, username, password, single)
+		outcome.unavailable += served.unavailable
+		outcome.rejected += served.rejected
+		if outcome.skipped == nil {
+			outcome.skipped = served.skipped
+		}
+		if err != nil {
+			return outcome, err
+		}
+	}
+
+	if outcome.rejected > len(pointers)/2 {
+		return outcome, fmt.Errorf("batch request rejected for %d of %d objects: %w", outcome.rejected, len(pointers), err)
+	}
+	return outcome, nil
+}
+
+// downloadChunk streams every object the batch scheduled. An object the endpoint
+// refuses to serve is recorded and skipped so its siblings still reach the
+// mirror; any other failure — a corrupt download, a broken connection — comes
+// back as an error.
+func (f *Fetcher) downloadChunk(
+	ctx context.Context,
+	store, endpoint, username, password string,
+	objects []batchResponseObject,
+) (chunkOutcome, error) {
+	var outcome chunkOutcome
+	for _, object := range objects {
+		if object.Error != nil {
+			outcome.unavailable++
+			if outcome.skipped == nil {
+				outcome.skipped = fmt.Errorf("%w: LFS object %s is unavailable: %s",
+					errObjectUnavailable, shortOID(object.OID), object.Error.Message)
+			}
+			continue
+		}
+		if err := downloadObjects(ctx, f.client, store, endpoint, username, password, []batchResponseObject{object}); err != nil {
+			return outcome, err
+		}
+	}
+	return outcome, nil
 }
 
 // resolveEndpoint determines the LFS API root: an lfs.url override from the
@@ -84,12 +225,11 @@ func (f *Fetcher) FetchAll(ctx context.Context, repositoryPath, remoteURL, usern
 // .lfsconfig is best-effort — any failure falls back to the derived endpoint,
 // matching the common deployment.
 func resolveEndpoint(repository *git.Repository, remoteURL string) (string, error) {
-	remote := strings.TrimSuffix(remoteURL, "/")
-	parsed, ok := paths.ParseHTTPURL(remote)
+	parsed, ok := paths.ParseHTTPURL(remoteURL)
 	if !ok {
 		return "", fmt.Errorf("unsupported remote URL '%s': only http and https are allowed", redactedURL(remoteURL))
 	}
-	endpoint := remote + "/info/lfs"
+	endpoint := defaultEndpoint(parsed)
 
 	config, err := readLFSConfig(repository)
 	if err != nil || config == nil {
@@ -112,6 +252,22 @@ func resolveEndpoint(repository *git.Repository, remoteURL string) (string, erro
 		return strings.TrimSuffix(overridden.String(), "/"), nil
 	}
 	return endpoint, nil
+}
+
+// defaultEndpoint derives the remote's standard LFS API root, including the
+// repository's .git suffix.
+//
+// Git LFS clients request "<remote>[/info/lfs]" with the suffix their remote
+// uses, and forges route only the suffixed path to their LFS service: GitHub
+// and GitLab answer a suffix-less /info/lfs with 422, while Forgejo and Gitea
+// accept either form. The mirror's remote has no .git suffix because a config
+// URL rarely carries one, so the suffix is added here whenever it is absent.
+func defaultEndpoint(remoteURL *url.URL) string {
+	path := strings.TrimSuffix(remoteURL.Path, "/")
+	if !strings.HasSuffix(path, ".git") {
+		path += ".git"
+	}
+	return remoteURL.Scheme + "://" + remoteURL.Host + path + "/info/lfs"
 }
 
 // isSchemeDefaultPort reports whether the URL's explicit port equals its

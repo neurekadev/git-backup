@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
@@ -119,6 +120,18 @@ func peelToCommitHash(repository *git.Repository, hash plumbing.Hash) plumbing.H
 	}
 }
 
+// scanTree collects pointers from every blob under treeHash, descending into
+// subtrees iteratively.
+//
+// Subtrees are walked from their tree objects directly rather than through
+// object.TreeWalker: that walker validates each entry against the rules for
+// materialising a working tree, so a repository containing a path that is
+// illegal on the host — a backslash in an entry name on Windows, for instance —
+// would abort the whole backup even though the mirror clones and uploads
+// perfectly well. A tree object only ever holds entry names and subtree hashes,
+// so enumerating them needs no path handling at all. seenTrees bounds the walk
+// for repositories whose history repeats or self-references a tree, and makes
+// the cross-ref scan visit each tree once (see collectPointers).
 func scanTree(
 	repository *git.Repository,
 	treeHash plumbing.Hash,
@@ -131,52 +144,65 @@ func scanTree(
 		return fmt.Errorf("read tree: %w", err)
 	}
 
-	walker := object.NewTreeWalker(tree, true, seenTrees)
-	defer walker.Close()
+	pending := []*object.Tree{tree}
+	seenTrees[treeHash] = true
 
-	for {
-		name, entry, err := walker.Next()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("walk tree: %w", err)
-		}
-		_ = name
+	for len(pending) > 0 {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
 
-		if !entry.Mode.IsFile() {
-			continue
-		}
-		if _, seen := seenBlobs[entry.Hash]; seen {
-			continue
-		}
-		seenBlobs[entry.Hash] = struct{}{}
+		for _, entry := range current.Entries {
+			if entry.Mode == filemode.Dir {
+				if seenTrees[entry.Hash] {
+					continue
+				}
+				seenTrees[entry.Hash] = true
 
-		blob, err := repository.BlobObject(entry.Hash)
-		if err != nil {
-			continue
-		}
-		if blob.Size > pointerMaxBytes {
-			continue
-		}
+				subtree, err := repository.TreeObject(entry.Hash)
+				if err != nil {
+					// A subtree missing from a partial fetch costs its
+					// pointers but leaves the rest of the scan intact.
+					continue
+				}
+				pending = append(pending, subtree)
+				continue
+			}
+			if !entry.Mode.IsFile() {
+				continue
+			}
+			if _, seen := seenBlobs[entry.Hash]; seen {
+				continue
+			}
+			seenBlobs[entry.Hash] = struct{}{}
 
-		reader, err := blob.Reader()
-		if err != nil {
-			continue
-		}
-		content, err := io.ReadAll(io.LimitReader(reader, pointerMaxBytes))
-		_ = reader.Close()
-		if err != nil {
-			continue
-		}
+			blob, err := repository.BlobObject(entry.Hash)
+			if err != nil {
+				continue
+			}
+			if blob.Size > pointerMaxBytes {
+				continue
+			}
 
-		if parsed, ok := parsePointer(content); ok {
-			if _, duplicate := seenPointers[parsed.oid]; !duplicate {
-				seenPointers[parsed.oid] = struct{}{}
-				*pointers = append(*pointers, parsed)
+			reader, err := blob.Reader()
+			if err != nil {
+				continue
+			}
+			content, err := io.ReadAll(io.LimitReader(reader, pointerMaxBytes))
+			_ = reader.Close()
+			if err != nil {
+				continue
+			}
+
+			if parsed, ok := parsePointer(content); ok {
+				if _, duplicate := seenPointers[parsed.oid]; !duplicate {
+					seenPointers[parsed.oid] = struct{}{}
+					*pointers = append(*pointers, parsed)
+				}
 			}
 		}
 	}
+
+	return nil
 }
 
 // parsePointer parses an LFS pointer file: the version line followed by

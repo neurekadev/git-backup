@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,6 +54,30 @@ type batchResponse struct {
 	Objects []batchResponseObject `json:"objects"`
 }
 
+// errBatchRejected marks a batch request the endpoint answered with an
+// unexpected status instead of scheduling the objects. Callers narrow such a
+// request down to individual objects, because a rejection is usually one
+// object's fault (the endpoint's object limit, a stale pointer) rather than the
+// whole batch's.
+var errBatchRejected = errors.New("batch request rejected by the endpoint")
+
+// errObjectUnavailable reports that the endpoint answered the batch request but
+// will not serve one of the objects it named, so the object cannot be mirrored.
+var errObjectUnavailable = errors.New("lfs object unavailable on the remote")
+
+// batchObjectError is one object the endpoint refused: a pointer kept in the
+// repository after its object was removed or garbage-collected on the server.
+type batchObjectError struct {
+	oid     string
+	message string
+}
+
+func (e *batchObjectError) Error() string {
+	return fmt.Sprintf("LFS object %s unavailable: %s", shortOID(e.oid), e.message)
+}
+
+func (e *batchObjectError) Unwrap() error { return errObjectUnavailable }
+
 // batchClient performs the LFS batch protocol over HTTP.
 type batchClient struct {
 	client *http.Client
@@ -69,7 +94,8 @@ const lfsMediaType = "application/vnd.git-lfs+json"
 
 // batch submits every pointer for download scheduling. A 403 or 404 from the
 // endpoint means the remote has Git LFS switched off, which callers treat as
-// an expected skip rather than a failure.
+// an expected skip rather than a failure. Any other unexpected status is
+// reported as errBatchRejected so callers can retry the pointers individually.
 func (c *batchClient) batch(ctx context.Context, endpoint, username, password string, pointers []pointer) ([]batchResponseObject, error) {
 	body, err := json.Marshal(batchRequest{
 		Operation: "download",
@@ -102,7 +128,7 @@ func (c *batchClient) batch(ctx context.Context, endpoint, username, password st
 	case http.StatusForbidden, http.StatusNotFound:
 		return nil, ErrDisabled
 	default:
-		return nil, fmt.Errorf("batch request failed with status %d", response.StatusCode)
+		return nil, fmt.Errorf("%w: status %d", errBatchRejected, response.StatusCode)
 	}
 
 	var decoded batchResponse
@@ -130,14 +156,14 @@ func downloadObjects(
 			return err
 		}
 		if object.Error != nil {
-			return fmt.Errorf("LFS object %s unavailable: %s", shortOID(object.OID), object.Error.Message)
+			return &batchObjectError{oid: object.OID, message: object.Error.Message}
 		}
 
 		action := object.Actions["download"]
 		if action == nil || action.Href == "" {
 			// The server knows the object but scheduled nothing; without a
 			// href there is nothing this client can do beyond reporting it.
-			return fmt.Errorf("LFS object %s has no download action", shortOID(object.OID))
+			return &batchObjectError{oid: object.OID, message: "no download action was scheduled"}
 		}
 
 		if err := downloadObject(ctx, client.client, store, endpointHost, username, password, object.OID, action); err != nil {
