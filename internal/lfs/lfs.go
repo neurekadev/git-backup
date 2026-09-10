@@ -340,18 +340,21 @@ func (f *Fetcher) downloadChunk(
 	if len(expired) > 0 {
 		rescheduled, err := f.client.batch(ctx, creds, endpoint, expired)
 		if err != nil {
-			// The fresh request failing is the fetch's problem to report, and
-			// the objects it covered count as unserved.
-			for range expired {
-				outcome.recordUnavailable(fmt.Errorf("%w: no fresh download URL was issued", errObjectUnavailable))
+			// The endpoint scheduled these objects and then would not schedule
+			// them again, so each one is recorded as unserved with its own name
+			// and the reason the fresh URL never arrived. That record is the
+			// failure: reporting the request's error again would turn objects
+			// that were accounted for into an unaccounted chunk failure.
+			for _, object := range expired {
+				outcome.recordUnavailable(fmt.Errorf("%w: no fresh download URL was issued for %s: %w", errObjectUnavailable, object.oid, err))
 			}
-			failed = append(failed, err)
 		} else {
 			againExpired, againUnavailable, againFailed := downloadObjects(ctx, f.client, store, endpoint, creds, rescheduled)
-			for range againExpired {
+			for _, object := range againExpired {
 				// A server issuing an already-lapsed URL twice has nothing more
-				// to offer for these objects.
-				outcome.recordUnavailable(fmt.Errorf("%w: the download URL lapsed before it could be used", errObjectUnavailable))
+				// to offer for these objects, and each is named so a caller can
+				// tell which content the mirror is missing.
+				outcome.recordUnavailable(fmt.Errorf("%w: the download URL for %s lapsed before it could be used", errObjectUnavailable, object.oid))
 			}
 			unavailable = append(unavailable, againUnavailable...)
 			failed = append(failed, againFailed...)

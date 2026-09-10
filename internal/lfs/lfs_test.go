@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -24,6 +25,12 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
+
+// roundTripFunc adapts a function to an http.RoundTripper, so a test can script
+// the exact responses the batch client sees.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
 
 func pointerFor(content []byte) (string, string) {
 	sum := sha256.Sum256(content)
@@ -102,9 +109,18 @@ type fakeLFSServer struct {
 	// requireAuth answers 401 to any request without an Authorization header,
 	// which is how a forge that wants credentials for the objects behaves.
 	requireAuth bool
+	// forbidAnonymous answers 403 to any request without an Authorization
+	// header, which is how a forge behaves when it refuses anonymous access
+	// outright rather than inviting a credential with 401. A 403 is also the
+	// status for LFS switched off, so a client that discovers the endpoint
+	// anonymously cannot tell the two apart.
+	forbidAnonymous bool
 	// lapseFirstAction makes the first schedule for each object point at an
 	// already-expired URL, so the client has to ask for a fresh one.
 	lapseFirstAction bool
+	// lapseEveryAction makes every schedule for each object point at an
+	// already-expired URL, so asking again cannot produce a usable one.
+	lapseEveryAction bool
 	// scheduled counts how many times each object has been scheduled.
 	scheduled map[string]int
 	// fetchStatus, when non-zero, is the status batch requests get once a probe
@@ -203,6 +219,7 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 	fetchStatus := s.fetchStatus
 	failedPaths := s.failedPaths
 	requireAuth := s.requireAuth
+	forbidAnonymous := s.forbidAnonymous
 	disabled := slices.Contains(s.disabledPaths, r.URL.Path)
 	servedHere := slices.Contains(s.servePaths, r.URL.Path)
 	hasServePaths := len(s.servePaths) > 0
@@ -221,6 +238,14 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		// The API wants credentials it was not given, which the client is
 		// expected to retry with.
 		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	if forbidAnonymous && r.Header.Get("Authorization") == "" {
+		// An anonymous request is refused outright, and the refusal is shaped
+		// exactly like a repository with LFS switched off.
+		w.Header().Set("Content-Type", lfsMediaType)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"Git LFS is disabled for this repository."}`))
 		return
 	}
 	if disabled {
@@ -261,6 +286,9 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		return
 	}
+	// fetchStatus, when set, is what the fetch gets once discovery has been
+	// answered, so a test can model an endpoint that serves discovery and then
+	// stops serving the fetch.
 	if fetchStatus != 0 && probed {
 		w.WriteHeader(fetchStatus)
 		return
@@ -319,7 +347,7 @@ func (s *fakeLFSServer) respond(w http.ResponseWriter, request batchRequest) {
 		action := &batchAction{Href: s.server.URL + "/download/" + object.OID}
 		s.mu.Lock()
 		s.scheduled[object.OID]++
-		lapse := s.lapseFirstAction && s.scheduled[object.OID] == 1
+		lapse := s.lapseEveryAction || (s.lapseFirstAction && s.scheduled[object.OID] == 1)
 		s.mu.Unlock()
 		if lapse {
 			// A URL that has already lapsed, as a server issuing a short-lived
@@ -592,11 +620,11 @@ func TestFetchAllGuessFailureDoesNotOverruleTheConfiguredPath(t *testing.T) {
 	}
 }
 
-// TestFetchAllRetriesWithCredentialsOnUnauthorized covers a forge that answers
-// 401 when credentials were not presented — which the batch API documents as
-// "credentials are needed, but were not sent" — so the client repeats the request
-// with them rather than failing a repository it could have read.
-func TestFetchAllRetriesWithCredentialsOnUnauthorized(t *testing.T) {
+// TestFetchAllOffersCredentialsOnTheFirstRequest covers a forge that serves
+// nothing to an anonymous request. The client presents its credentials straight
+// away rather than waiting to be asked, so such a forge is read as one that
+// wanted the credential rather than as a repository with LFS switched off.
+func TestFetchAllOffersCredentialsOnTheFirstRequest(t *testing.T) {
 	content := []byte("content")
 	oid, pointerText := pointerFor(content)
 
@@ -609,17 +637,48 @@ func TestFetchAllRetriesWithCredentialsOnUnauthorized(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(repositoryPath, ".git", "lfs", "objects",
 		oid[0:2], oid[2:4], oid)); err != nil {
-		t.Errorf("the object should be mirrored after the authenticated retry: %v", err)
+		t.Errorf("the object should be mirrored after the authenticated request: %v", err)
 	}
 
-	// Without credentials there is nothing to retry with, so the 401 stands.
+	// Without credentials there is nothing to present, so the 401 stands.
 	unauthenticated := newRepoWithLFS(t, map[string]string{"file.bin": pointerText})
 	err := NewFetcher().FetchAll(context.Background(), unauthenticated, lfsServer.remoteURL(), "", "")
 	if err == nil {
-		t.Fatal("a 401 with no credentials to offer should be reported")
+		t.Fatal("a 401 answered without credentials should be reported")
 	}
 	if errors.Is(err, ErrDisabled) {
 		t.Errorf("err = %v, want a failure rather than a repository recorded as LFS-free", err)
+	}
+}
+
+// TestFetchAllReadsAForbiddenAnonymousRequestAsCredentialsNeeded covers the case
+// a 401-only client gets wrong: a forge that refuses anonymous requests with 403
+// instead of inviting a credential with 401. A 403 is also how a repository with
+// LFS switched off answers, so the credentials have to be offered on the first
+// request — discovering the endpoint anonymously would record the repository as
+// LFS-free and back it up without its LFS content.
+func TestFetchAllReadsAForbiddenAnonymousRequestAsCredentialsNeeded(t *testing.T) {
+	content := []byte("content")
+	oid, pointerText := pointerFor(content)
+
+	lfsServer := newFakeLFSServer(t, map[string][]byte{oid: content})
+	lfsServer.forbidAnonymous = true
+	repositoryPath := newRepoWithLFS(t, map[string]string{"file.bin": pointerText})
+
+	if err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.remoteURL(), "user", "token"); err != nil {
+		t.Fatalf("FetchAll failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repositoryPath, ".git", "lfs", "objects",
+		oid[0:2], oid[2:4], oid)); err != nil {
+		t.Errorf("the object should be mirrored rather than the repository recorded as LFS-free: %v", err)
+	}
+
+	// The same server without credentials says nothing about the credential, so
+	// its refusal is read the only way it can be: LFS is not available here.
+	unauthenticated := newRepoWithLFS(t, map[string]string{"file.bin": pointerText})
+	err := NewFetcher().FetchAll(context.Background(), unauthenticated, lfsServer.remoteURL(), "", "")
+	if !errors.Is(err, ErrDisabled) {
+		t.Errorf("err = %v, want a repository recorded as LFS-free when the forge refuses anonymously", err)
 	}
 }
 
@@ -650,6 +709,124 @@ func TestFetchAllAsksAgainWhenTheDownloadURLLapsed(t *testing.T) {
 	}
 	if downloads := lfsServer.downloadCount(oid); downloads != 1 {
 		t.Errorf("download count = %d, want the object streamed exactly once", downloads)
+	}
+}
+
+// TestDownloadObjectsSkipsCachedObjectsWhoseURLLapsed covers content that is
+// already in the store being scheduled with an expired URL. The object needs
+// nothing from the endpoint, so it is settled from the cache before the expiry
+// can send it back for rescheduling, which is what made an already-mirrored
+// repository fail over a fresh URL it never needed.
+func TestDownloadObjectsSkipsCachedObjectsWhoseURLLapsed(t *testing.T) {
+	content := []byte("content")
+	oid, _ := pointerFor(content)
+
+	store := t.TempDir()
+	cached := filepath.Join(store, oid[0:2], oid[2:4])
+	if err := os.MkdirAll(cached, 0o755); err != nil {
+		t.Fatalf("prepare the store: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cached, oid), content, 0o644); err != nil {
+		t.Fatalf("place the cached object: %v", err)
+	}
+
+	expired, unavailable, failed := downloadObjects(context.Background(), newBatchClient(nil), store,
+		"http://127.0.0.1:1/repo.git/info/lfs", credentials{}, []batchResponseObject{{
+			OID:  oid,
+			Size: int64(len(content)),
+			Actions: map[string]*batchAction{"download": {
+				Href:      "http://127.0.0.1:1/download/" + oid,
+				ExpiresAt: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+			}},
+		}})
+
+	if len(expired) != 0 {
+		t.Errorf("expired = %v, want cached content not sent back for a fresh URL", expired)
+	}
+	if len(unavailable) != 0 || len(failed) != 0 {
+		t.Errorf("unavailable = %v, failed = %v, want cached content left alone", unavailable, failed)
+	}
+}
+
+// TestFetchAllNamesObjectsWhoseRefreshFailed covers an endpoint that only ever
+// schedules lapsed URLs and then refuses the request for fresh ones. Each object
+// has to be reported by name — a count tells a caller nothing about what is
+// missing from the mirror — and the refusal is that record's reason rather than
+// a second, chunk-level failure over objects already accounted for.
+func TestFetchAllNamesObjectsWhoseRefreshFailed(t *testing.T) {
+	content := []byte("content")
+	oid, pointerText := pointerFor(content)
+
+	lfsServer := newFakeLFSServer(t, map[string][]byte{oid: content})
+	lfsServer.lapseEveryAction = true
+	repositoryPath := newRepoWithLFS(t, map[string]string{"file.bin": pointerText})
+
+	err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.remoteURL(), "", "")
+	if err == nil {
+		t.Fatal("an object that never arrived should be reported")
+	}
+	if !strings.Contains(err.Error(), oid) {
+		t.Errorf("err = %v, want it to name the object that could not be fetched", err)
+	}
+	if !errors.Is(err, errObjectUnavailable) {
+		t.Errorf("err = %v, want the object recorded as unserved", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(repositoryPath, ".git", "lfs", "objects",
+		oid[0:2], oid[2:4], oid)); statErr == nil {
+		t.Error("the object should not be in the store, since it was never downloaded")
+	}
+}
+
+// TestDownloadChunkReportsARefusedRefreshPerObject covers the endpoint scheduling
+// a lapsed URL and then refusing outright to issue a fresh one. The refusal is
+// the reason the object went unserved, so it is reported through that object —
+// named — rather than as a further chunk-level failure over objects that were
+// already accounted for.
+func TestDownloadChunkReportsARefusedRefreshPerObject(t *testing.T) {
+	const endpoint = "http://127.0.0.1:1/repo.git/info/lfs"
+	oid, _ := pointerFor([]byte("content"))
+
+	// downloadObjects settles the chunk's own objects from the response it is
+	// handed, so the first request this transport sees is the one asking for a
+	// fresh URL; that one is refused.
+	batches := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		batches++
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	fetcher := &Fetcher{client: newBatchClient(client)}
+	outcome, err := fetcher.downloadChunk(context.Background(), t.TempDir(), endpoint, credentials{}, []batchResponseObject{
+		{OID: oid, Size: 7, Actions: map[string]*batchAction{"download": {
+			Href:      endpoint + "/download/" + oid,
+			ExpiresAt: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+		}}},
+	})
+
+	if batches != 1 {
+		t.Errorf("batch requests = %d, want one asking for a fresh URL", batches)
+	}
+	if err != nil {
+		t.Errorf("downloadChunk err = %v, want the refusal carried by the object rather than the chunk", err)
+	}
+	if outcome.unavailable != 1 {
+		t.Errorf("unavailable = %d, want the object recorded as unserved", outcome.unavailable)
+	}
+	if outcome.skipped == nil {
+		t.Fatal("the object's reason should be reported")
+	}
+	if !errors.Is(outcome.skipped, errObjectUnavailable) {
+		t.Errorf("reason = %v, want the object recorded as unserved", outcome.skipped)
+	}
+	if !strings.Contains(outcome.skipped.Error(), oid) {
+		t.Errorf("reason = %v, want it to name the object", outcome.skipped)
+	}
+	if !strings.Contains(outcome.skipped.Error(), fmt.Sprint(http.StatusInternalServerError)) {
+		t.Errorf("reason = %v, want the endpoint's own status as why no fresh URL arrived", outcome.skipped)
 	}
 }
 
