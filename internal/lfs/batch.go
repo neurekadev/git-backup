@@ -145,12 +145,19 @@ func (c *batchClient) probe(ctx context.Context, endpoint, username, password st
 		// Nothing is mounted at this path: a host that routes by path answers
 		// 404.
 		return ErrNoEndpoint
-	default:
-		// Unprocessable is how an edge refuses a path it does not serve as much
-		// as it is how the API refuses a request's shape, so the body separates
-		// them; every other status describes the endpoint and is reported rather
-		// than read as a wrong path.
+	case http.StatusUnprocessableEntity:
+		// Unprocessable is how an edge refuses a path it does not route as much
+		// as it is how the API refuses a request's shape. A single object cannot
+		// trip an object limit, so a page here is a wrong path and anything else
+		// is the API refusing the probe.
 		return classifyRefusal(response, fmt.Errorf("batch request failed with status %d", response.StatusCode))
+	default:
+		// Every other status describes the endpoint or the credential rather
+		// than the path — a rate limit, an authentication failure, the server's
+		// own error — so it stays a reported failure. Reading an edge's error
+		// page as "no endpoint here" would let the mirror layer record a broken
+		// or unauthorized service as a repository with LFS switched off.
+		return fmt.Errorf("batch request failed with status %d", response.StatusCode)
 	}
 }
 

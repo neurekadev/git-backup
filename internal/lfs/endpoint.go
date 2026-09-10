@@ -95,20 +95,25 @@ func (f *Fetcher) selectEndpoint(
 		case errors.Is(err, ErrNoEndpoint):
 			slog.Debug("No Git LFS API is mounted at this endpoint.", "endpoint", redactedURL(candidate))
 		default:
-			slog.Debug("Git LFS API did not answer.", "endpoint", redactedURL(candidate), "detail", err.Error())
+			// The endpoint and the error both describe URLs, and the error's own
+			// text repeats the one the request went to, so it is redacted too
+			// before it reaches the log.
+			slog.Debug("Git LFS API did not answer.",
+				"endpoint", redactedURL(candidate), "detail", redactedURL(err.Error()))
 			if failed == nil {
 				failed = err
 			}
 		}
 	}
 	switch {
-	case failed != nil:
-		// A candidate that failed describes something wrong beyond a missing
-		// path, so it outranks a disabled verdict another candidate gave: the
-		// failure is reported rather than recorded as a successful skip.
-		return "", failed
 	case disabled != nil:
+		// A service that answered "LFS is off for this repository" identified
+		// the API root, and that verdict is the mirror layer's expected skip. A
+		// wrong path answering differently must not turn the repository into a
+		// failure.
 		return "", disabled
+	case failed != nil:
+		return "", failed
 	default:
 		// No candidate serves the API. The mirror layer records that as LFS
 		// being switched off rather than failing the repository, which is the

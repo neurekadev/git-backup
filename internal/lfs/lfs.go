@@ -330,12 +330,11 @@ func (f *Fetcher) downloadChunk(
 	for _, object := range unavailable {
 		outcome.recordUnavailable(fmt.Errorf("%w: %s", errObjectUnavailable, object.Error()))
 	}
-	// An object the endpoint answered for — streamed now or already in the store,
-	// which is what cached counts — is positive evidence that it processed this
-	// chunk, so a rejection beside one is that object's fault rather than the
-	// endpoint's.
-	outcome.served = len(objects) > len(unavailable)
-	_ = cached
+	// The endpoint answering for an object is the evidence that it processed
+	// this chunk, and it answered for these either way: streamed now, or already
+	// in the store. A chunk it answered for is not a chunk it refused, so a
+	// rejection beside them is one object's fault rather than the endpoint's.
+	outcome.served = len(objects) > len(unavailable)+len(cached)
 	if len(failed) > 0 {
 		return outcome, fmt.Errorf("%d of %d LFS objects could not be downloaded: %w", len(failed), len(objects), failed[0])
 	}
