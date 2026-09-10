@@ -244,7 +244,7 @@ func (f *Fetcher) fetchChunk(
 ) (chunkOutcome, error) {
 	objects, err := f.client.batch(ctx, creds, endpoint, pointers)
 	if err == nil {
-		return f.downloadChunk(ctx, store, endpoint, creds, objects)
+		return f.downloadChunk(ctx, store, endpoint, creds, pointers, objects)
 	}
 	if !errors.Is(err, errBatchRejected) {
 		return chunkOutcome{}, err
@@ -332,9 +332,10 @@ func (f *Fetcher) downloadChunk(
 	ctx context.Context,
 	store, endpoint string,
 	creds credentials,
+	want []pointer,
 	objects []batchResponseObject,
 ) (chunkOutcome, error) {
-	expired, unavailable, failed := downloadObjects(ctx, f.client, store, endpoint, creds, objects)
+	expired, unavailable, failed := downloadObjects(ctx, f.client, store, endpoint, creds, want, objects)
 
 	var outcome chunkOutcome
 	if len(expired) > 0 {
@@ -349,7 +350,7 @@ func (f *Fetcher) downloadChunk(
 				outcome.recordUnavailable(fmt.Errorf("%w: no fresh download URL was issued for %s: %w", errObjectUnavailable, object.oid, err))
 			}
 		} else {
-			againExpired, againUnavailable, againFailed := downloadObjects(ctx, f.client, store, endpoint, creds, rescheduled)
+			againExpired, againUnavailable, againFailed := downloadObjects(ctx, f.client, store, endpoint, creds, expired, rescheduled)
 			for _, object := range againExpired {
 				// A server issuing an already-lapsed URL twice has nothing more
 				// to offer for these objects, and each is named so a caller can

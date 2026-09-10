@@ -326,9 +326,18 @@ func downloadObjects(
 	client *batchClient,
 	store, endpoint string,
 	creds credentials,
+	want []pointer,
 	objects []batchResponseObject,
 ) (expired []pointer, unavailable []*batchObjectError, failed []error) {
 	endpointHost := hostOf(endpoint)
+	// The endpoint's OIDs are used as path components and sliced for the shard
+	// directories, so an object that was not asked for — or one whose OID is not
+	// a SHA-256 digest — is refused before any of that: a short OID would panic
+	// the slice, and a crafted one could name a path outside the store.
+	requested := make(map[string]bool, len(want))
+	for _, pointer := range want {
+		requested[pointer.oid] = true
+	}
 	answered := func(object batchResponseObject) *batchObjectError {
 		switch {
 		case object.Error != nil:
@@ -337,6 +346,10 @@ func downloadObjects(
 			// The server knows the object but scheduled nothing; without an
 			// href there is nothing this client can do beyond reporting it.
 			return &batchObjectError{oid: object.OID, message: "no download action was scheduled"}
+		case !isSHA256Hex(object.OID):
+			return &batchObjectError{oid: shortOID(object.OID), message: "the endpoint described an object whose oid is not a sha256 digest"}
+		case !requested[object.OID]:
+			return &batchObjectError{oid: shortOID(object.OID), message: "the endpoint described an object that was not requested"}
 		default:
 			return nil
 		}
@@ -350,10 +363,13 @@ func downloadObjects(
 			unavailable = append(unavailable, refused)
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(store, object.OID[0:2], object.OID[2:4], object.OID)); err == nil {
+		if cached, err := os.Stat(filepath.Join(store, object.OID[0:2], object.OID[2:4], object.OID)); err == nil &&
+			cached.Mode().IsRegular() && cached.Size() == object.Size {
 			// Already cached by a previous snapshot; git-lfs also skips it, and
 			// content already held needs no fresh URL, so this is settled before
-			// the expiry below can send it back for rescheduling.
+			// the expiry below can send it back for rescheduling. A file of the
+			// wrong length is not this object, so it falls through to the
+			// download, which verifies the digest as the bytes arrive.
 			continue
 		}
 		action := object.Actions["download"]

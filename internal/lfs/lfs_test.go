@@ -731,7 +731,9 @@ func TestDownloadObjectsSkipsCachedObjectsWhoseURLLapsed(t *testing.T) {
 	}
 
 	expired, unavailable, failed := downloadObjects(context.Background(), newBatchClient(nil), store,
-		"http://127.0.0.1:1/repo.git/info/lfs", credentials{}, []batchResponseObject{{
+		"http://127.0.0.1:1/repo.git/info/lfs", credentials{},
+		[]pointer{{oid: oid, size: int64(len(content))}},
+		[]batchResponseObject{{
 			OID:  oid,
 			Size: int64(len(content)),
 			Actions: map[string]*batchAction{"download": {
@@ -800,12 +802,14 @@ func TestDownloadChunkReportsARefusedRefreshPerObject(t *testing.T) {
 	})}
 
 	fetcher := &Fetcher{client: newBatchClient(client)}
-	outcome, err := fetcher.downloadChunk(context.Background(), t.TempDir(), endpoint, credentials{}, []batchResponseObject{
-		{OID: oid, Size: 7, Actions: map[string]*batchAction{"download": {
-			Href:      endpoint + "/download/" + oid,
-			ExpiresAt: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
-		}}},
-	})
+	outcome, err := fetcher.downloadChunk(context.Background(), t.TempDir(), endpoint, credentials{},
+		[]pointer{{oid: oid, size: 7}},
+		[]batchResponseObject{
+			{OID: oid, Size: 7, Actions: map[string]*batchAction{"download": {
+				Href:      endpoint + "/download/" + oid,
+				ExpiresAt: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+			}}},
+		})
 
 	if batches != 1 {
 		t.Errorf("batch requests = %d, want one asking for a fresh URL", batches)
@@ -827,6 +831,48 @@ func TestDownloadChunkReportsARefusedRefreshPerObject(t *testing.T) {
 	}
 	if !strings.Contains(outcome.skipped.Error(), fmt.Sprint(http.StatusInternalServerError)) {
 		t.Errorf("reason = %v, want the endpoint's own status as why no fresh URL arrived", outcome.skipped)
+	}
+}
+
+// TestDownloadObjectsRefusesMalformedAndUnrequestedOIDs covers an endpoint whose
+// response names objects the client never asked for. The OID becomes a path
+// component and is sliced for the shard directories, so a malformed one has to be
+// refused before either happens: a short OID would panic the slice and cost the
+// whole backup, and a crafted one would name a path outside the store.
+func TestDownloadObjectsRefusesMalformedAndUnrequestedOIDs(t *testing.T) {
+	wanted := strings.Repeat("a", 64)
+	unrelated := strings.Repeat("b", 64)
+	downloads := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		downloads++
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+	})}
+
+	expired, unavailable, failed := downloadObjects(context.Background(), newBatchClient(client), t.TempDir(),
+		"http://127.0.0.1:1/repo.git/info/lfs", credentials{},
+		[]pointer{{oid: wanted, size: 7}},
+		[]batchResponseObject{
+			{OID: "ab", Size: 7, Actions: map[string]*batchAction{"download": {Href: "http://127.0.0.1:1/download/ab"}}},
+			{OID: "sha/../escape", Size: 7, Actions: map[string]*batchAction{"download": {Href: "http://127.0.0.1:1/download/escape"}}},
+			{OID: unrelated, Size: 7, Actions: map[string]*batchAction{"download": {Href: "http://127.0.0.1:1/download/" + unrelated}}},
+		})
+
+	if len(expired) != 0 || len(failed) != 0 {
+		t.Errorf("expired = %v, failed = %v, want the bad objects refused without a transfer", expired, failed)
+	}
+	if downloads != 0 {
+		t.Errorf("downloads = %d, want nothing fetched for objects the client did not ask for", downloads)
+	}
+	if len(unavailable) != 3 {
+		t.Fatalf("unavailable = %d, want every bad object reported rather than acted on", len(unavailable))
+	}
+	for _, object := range unavailable {
+		if !errors.Is(object, errObjectUnavailable) {
+			t.Errorf("object error = %v, want it recorded as unserved", object)
+		}
+	}
+	if !errors.Is(unavailable[2], errObjectUnavailable) || !strings.Contains(unavailable[2].Error(), "not requested") {
+		t.Errorf("third error = %v, want the unrequested object reported as such", unavailable[2])
 	}
 }
 
