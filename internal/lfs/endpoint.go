@@ -104,21 +104,22 @@ func endpointCandidates(repository *git.Repository, parsed *url.URL) ([]endpoint
 // off, nothing is mounted at that path, or the endpoint failed — so the fetch
 // then runs against one known-good endpoint with no fallback to reconcile.
 //
-// Every candidate is asked, and what decides the repository is the strongest
-// answer collected. A failure on a path the remote actually configures outranks
-// a disabled verdict from a derived guess, because a failure describes the
-// endpoint itself and the mirror layer records disabled as a successful skip:
-// preferring the guess's verdict would mirror the repository with no LFS content
-// and raise nothing. A disabled verdict from the configured path is the
-// repository's own answer, so it wins instead — a guess that is merely wrong for
-// the host must not turn a repository with nothing to mirror into a failure.
+// Every candidate is asked, and what decides the repository is the answer from
+// the path the remote itself configures. A derived guess never overrides that
+// path's answer in either direction: a guess reporting "LFS is off" must not mask
+// a credential, rate-limit, server, or transport failure on the configured path
+// — the mirror layer records disabled as a successful skip, so that would mirror
+// the repository with no LFS content and raise nothing — and a guess failing must
+// not turn a configured path's "LFS is off" into a failed backup. The guess only
+// decides when the configured path said nothing itself, which is the case it
+// exists for: a host that routes LFS solely under the suffixed path.
 func (f *Fetcher) selectEndpoint(
 	ctx context.Context,
 	candidates []endpointCandidate,
 	username, password string,
 	first pointer,
 ) (string, error) {
-	var disabled, disabledFromConfigured, failed, configuredFailed error
+	var configured, derived error
 	for _, candidate := range candidates {
 		switch err := f.client.probe(ctx, candidate.url, username, password, first); {
 		case err == nil:
@@ -126,11 +127,12 @@ func (f *Fetcher) selectEndpoint(
 			return candidate.url, nil
 		case errors.Is(err, ErrDisabled):
 			slog.Debug("Git LFS is switched off for this repository.", "endpoint", redactedURL(candidate.url))
-			if disabled == nil {
-				disabled = err
-			}
-			if !candidate.derived && disabledFromConfigured == nil {
-				disabledFromConfigured = err
+			if candidate.derived {
+				if derived == nil {
+					derived = err
+				}
+			} else if configured == nil {
+				configured = err
 			}
 		case errors.Is(err, ErrNoEndpoint):
 			slog.Debug("No Git LFS API is mounted at this endpoint.", "endpoint", redactedURL(candidate.url))
@@ -140,28 +142,27 @@ func (f *Fetcher) selectEndpoint(
 			// before it reaches the log.
 			slog.Debug("Git LFS API did not answer.",
 				"endpoint", redactedURL(candidate.url), "detail", redactedURL(err.Error()))
-			if failed == nil {
-				failed = err
-			}
-			if !candidate.derived && configuredFailed == nil {
-				configuredFailed = err
+			if candidate.derived {
+				if derived == nil {
+					derived = err
+				}
+			} else if configured == nil {
+				configured = err
 			}
 		}
 	}
 
-	// A disabled verdict only decides when nothing failed on the path the remote
-	// configures, or when the configured path is the one that reported it.
-	if disabledFromConfigured != nil || (disabled != nil && configuredFailed == nil) {
-		if failed != nil {
-			// The failure still happened, so it is kept for the debug trail
-			// rather than discarded — it is just not what decides the fetch.
-			slog.Debug("A candidate path failed while another reported Git LFS disabled.",
-				"detail", redactedURL(failed.Error()))
+	if configured != nil {
+		if derived != nil {
+			// The guess's answer is kept for the debug trail rather than
+			// discarded — it is just not what decides the fetch.
+			slog.Debug("The derived path answered differently from the configured one.",
+				"detail", redactedURL(derived.Error()))
 		}
-		return "", disabled
+		return "", configured
 	}
-	if failed != nil {
-		return "", failed
+	if derived != nil {
+		return "", derived
 	}
 	// No candidate serves the API. The mirror layer records that as LFS being
 	// switched off rather than failing the repository, which is the closest

@@ -523,18 +523,17 @@ func TestFetchAllNotServedAnywhereIsSkipped(t *testing.T) {
 	}
 }
 
-// TestFetchAllDisabledOutranksAWrongPathsFailure covers the mixed case: the
-// repository's own API root answers that LFS is switched off, while the other
-// candidate path fails outright. The expected skip must win, because a guess that
-// is wrong for the host must not turn a repository with no LFS content to mirror
-// into a failed backup — and the failure still has to be visible in the debug
-// trail rather than discarded.
-func TestFetchAllDisabledOutranksAWrongPathsFailure(t *testing.T) {
+// TestFetchAllConfiguredPathDecidesOverTheGuess covers the rule that only the
+// path the remote itself configures decides: a failure there is reported even
+// when a derived guess answers that LFS is off, because the mirror layer records
+// that verdict as a successful skip and would hide a repository whose LFS content
+// is missing.
+func TestFetchAllConfiguredPathDecidesOverTheGuess(t *testing.T) {
 	oid, pointerText := pointerFor([]byte("content"))
 
 	lfsServer := newFakeLFSServer(t, map[string][]byte{oid: []byte("content")})
-	// The suffixed path is the repository's own, and reports LFS off; the
-	// suffix-less path the remote configures is broken.
+	// The remote is suffix-less, so the suffix-less path is configured and the
+	// suffixed guess is the one that reports LFS off.
 	lfsServer.disabledFor(lfsServer.remoteURL())
 	lfsServer.failedPaths = map[string]int{
 		batchPathFor(lfsServer.plainRemoteURL()): http.StatusInternalServerError,
@@ -542,11 +541,29 @@ func TestFetchAllDisabledOutranksAWrongPathsFailure(t *testing.T) {
 	repositoryPath := newRepoWithLFS(t, map[string]string{"file.bin": pointerText})
 
 	err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.plainRemoteURL(), "", "")
-	if !errors.Is(err, ErrDisabled) {
-		t.Fatalf("err = %v, want the disabled verdict to be the expected skip", err)
+	if err == nil || errors.Is(err, ErrDisabled) {
+		t.Fatalf("err = %v, want the configured path's failure reported rather than a skip", err)
 	}
-	if errors.Is(err, ErrNoEndpoint) {
-		t.Error("a wrong path's answer must not become the reason the repository is skipped")
+}
+
+// TestFetchAllGuessFailureDoesNotOverruleTheConfiguredPath covers the other
+// direction: the configured path reports LFS off while the derived guess fails,
+// so the configured path's verdict is what the repository is recorded as.
+func TestFetchAllGuessFailureDoesNotOverruleTheConfiguredPath(t *testing.T) {
+	oid, pointerText := pointerFor([]byte("content"))
+
+	lfsServer := newFakeLFSServer(t, map[string][]byte{oid: []byte("content")})
+	// The remote is suffix-less, so the suffix-less path is the configured one,
+	// and the suffixed guess is the one that fails.
+	lfsServer.disabledFor(lfsServer.plainRemoteURL())
+	lfsServer.failedPaths = map[string]int{
+		batchPathFor(lfsServer.remoteURL()): http.StatusInternalServerError,
+	}
+	repositoryPath := newRepoWithLFS(t, map[string]string{"file.bin": pointerText})
+
+	err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.plainRemoteURL(), "", "")
+	if !errors.Is(err, ErrDisabled) {
+		t.Fatalf("err = %v, want the configured path's disabled verdict to be the expected skip", err)
 	}
 }
 
