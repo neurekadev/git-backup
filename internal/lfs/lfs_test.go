@@ -993,6 +993,28 @@ func TestDownloadObjectsTrustsTheCacheWhenTheEndpointReportsNoSize(t *testing.T)
 	if len(unstatedFailed) == 0 {
 		t.Error("a cached file the pointer's size contradicts should fall through to a download")
 	}
+
+	// The resolved size has to travel with an object that is rescheduled, so the
+	// refresh request and the pass over its answer keep the pointer's length
+	// instead of falling back to an endpoint that stated none.
+	expiredPointers, _, _ := downloadObjects(context.Background(), newBatchClient(nil), shortStore,
+		"http://127.0.0.1:1/repo.git/info/lfs", credentials{},
+		[]pointer{{oid: oid, size: int64(len(content))}},
+		[]batchResponseObject{{
+			OID:  oid,
+			Size: 0,
+			Actions: map[string]*batchAction{"download": {
+				Href:      "http://127.0.0.1:1/download/" + oid,
+				ExpiresAt: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+			}},
+		}})
+	if len(expiredPointers) != 1 {
+		t.Fatalf("expired = %v, want the lapsed object rescheduled", expiredPointers)
+	}
+	if expiredPointers[0].size != int64(len(content)) {
+		t.Errorf("rescheduled size = %d, want the pointer's %d rather than the endpoint's unstated 0",
+			expiredPointers[0].size, len(content))
+	}
 }
 
 func TestFetchAllUnauthorizedIsNotDisabled(t *testing.T) {

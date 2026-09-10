@@ -395,8 +395,11 @@ func downloadObjects(
 		if action.expired() {
 			// The URL lapsed before it was used — a long scan, a slow batch, a
 			// small expires_in — so the object needs a fresh one rather than a
-			// transfer that can only fail.
-			expired = append(expired, pointer{oid: oid, size: object.Size})
+			// transfer that can only fail. The resolved size travels with it, so
+			// the refresh request and the pass over its answer keep the length
+			// the pointer records rather than falling back to an endpoint that
+			// stated none.
+			expired = append(expired, pointer{oid: oid, size: size})
 			continue
 		}
 		if err := downloadObject(ctx, client.client, store, endpointHost, creds, oid, action); err != nil {
