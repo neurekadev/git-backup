@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -338,38 +339,47 @@ func downloadObjects(
 	for _, pointer := range want {
 		requested[pointer.oid] = true
 	}
-	answered := func(object batchResponseObject) *batchObjectError {
+	// answered also returns the canonical spelling of the object's OID: the
+	// pointer's OIDs are lowercase, while an endpoint may echo a valid digest in
+	// upper case. The OID is a path component and the store is keyed by it, so
+	// the response is folded to the spelling the store already uses.
+	answered := func(object batchResponseObject) (string, *batchObjectError) {
 		switch {
 		case object.Error != nil:
-			return &batchObjectError{oid: object.OID, message: object.Error.Message}
+			return "", &batchObjectError{oid: object.OID, message: object.Error.Message}
 		case object.Actions["download"] == nil || object.Actions["download"].Href == "":
 			// The server knows the object but scheduled nothing; without an
 			// href there is nothing this client can do beyond reporting it.
-			return &batchObjectError{oid: object.OID, message: "no download action was scheduled"}
+			return "", &batchObjectError{oid: object.OID, message: "no download action was scheduled"}
 		case !isSHA256Hex(object.OID):
-			return &batchObjectError{oid: shortOID(object.OID), message: "the endpoint described an object whose oid is not a sha256 digest"}
-		case !requested[object.OID]:
-			return &batchObjectError{oid: shortOID(object.OID), message: "the endpoint described an object that was not requested"}
-		default:
-			return nil
+			return "", &batchObjectError{oid: shortOID(object.OID), message: "the endpoint described an object whose oid is not a sha256 digest"}
 		}
+		oid := strings.ToLower(object.OID)
+		if !requested[oid] {
+			return "", &batchObjectError{oid: shortOID(object.OID), message: "the endpoint described an object that was not requested"}
+		}
+		return oid, nil
 	}
 
 	for _, object := range objects {
 		if err := ctx.Err(); err != nil {
 			return expired, unavailable, append(failed, err)
 		}
-		if refused := answered(object); refused != nil {
+		oid, refused := answered(object)
+		if refused != nil {
 			unavailable = append(unavailable, refused)
 			continue
 		}
-		if cached, err := os.Stat(filepath.Join(store, object.OID[0:2], object.OID[2:4], object.OID)); err == nil &&
-			cached.Mode().IsRegular() && cached.Size() == object.Size {
+		if cached, err := os.Stat(filepath.Join(store, oid[0:2], oid[2:4], oid)); err == nil &&
+			cached.Mode().IsRegular() && (object.Size == 0 || cached.Size() == object.Size) {
 			// Already cached by a previous snapshot; git-lfs also skips it, and
 			// content already held needs no fresh URL, so this is settled before
-			// the expiry below can send it back for rescheduling. A file of the
-			// wrong length is not this object, so it falls through to the
-			// download, which verifies the digest as the bytes arrive.
+			// the expiry below can send it back for rescheduling. A file of a
+			// length the endpoint contradicts is not this object, so it falls
+			// through to the download, which verifies the digest as bytes
+			// arrive. An endpoint that reports no size leaves the length
+			// unstated rather than contradicted, and re-downloading content the
+			// store already holds would risk failing over it.
 			continue
 		}
 		action := object.Actions["download"]
@@ -377,10 +387,10 @@ func downloadObjects(
 			// The URL lapsed before it was used — a long scan, a slow batch, a
 			// small expires_in — so the object needs a fresh one rather than a
 			// transfer that can only fail.
-			expired = append(expired, pointer{oid: object.OID, size: object.Size})
+			expired = append(expired, pointer{oid: oid, size: object.Size})
 			continue
 		}
-		if err := downloadObject(ctx, client.client, store, endpointHost, creds, object.OID, action); err != nil {
+		if err := downloadObject(ctx, client.client, store, endpointHost, creds, oid, action); err != nil {
 			failed = append(failed, err)
 		}
 	}

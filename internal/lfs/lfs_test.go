@@ -876,6 +876,108 @@ func TestDownloadObjectsRefusesMalformedAndUnrequestedOIDs(t *testing.T) {
 	}
 }
 
+// TestDownloadObjectsAcceptsAnUppercaseOID covers an endpoint that echoes a valid
+// digest in upper case. The OID is a path component and the store is keyed by it,
+// so the response has to fold to the spelling the store uses: taken literally it
+// would be written to a second directory, miss the cache it should hit, and be
+// rejected as an object that was never requested.
+func TestDownloadObjectsAcceptsAnUppercaseOID(t *testing.T) {
+	content := []byte("content")
+	oid, _ := pointerFor(content)
+
+	store := t.TempDir()
+	cached := filepath.Join(store, oid[0:2], oid[2:4])
+	if err := os.MkdirAll(cached, 0o755); err != nil {
+		t.Fatalf("prepare the store: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cached, oid), content, 0o644); err != nil {
+		t.Fatalf("place the cached object: %v", err)
+	}
+
+	downloads := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		downloads++
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+	})}
+
+	expired, unavailable, failed := downloadObjects(context.Background(), newBatchClient(client), store,
+		"http://127.0.0.1:1/repo.git/info/lfs", credentials{},
+		[]pointer{{oid: oid, size: int64(len(content))}},
+		[]batchResponseObject{{
+			OID:     strings.ToUpper(oid),
+			Size:    int64(len(content)),
+			Actions: map[string]*batchAction{"download": {Href: "http://127.0.0.1:1/download/" + oid}},
+		}})
+
+	if len(expired) != 0 || len(unavailable) != 0 || len(failed) != 0 {
+		t.Errorf("expired = %v, unavailable = %v, failed = %v, want the uppercase digest accepted", expired, unavailable, failed)
+	}
+	if downloads != 0 {
+		t.Errorf("downloads = %d, want the cached object recognised rather than fetched again", downloads)
+	}
+}
+
+// TestDownloadObjectsTrustsTheCacheWhenTheEndpointReportsNoSize covers an
+// endpoint that omits the object's size. The length is then unstated rather than
+// contradicted, so content the store already holds must not be re-downloaded —
+// with a lapsed URL that would escalate into failing a backup whose LFS content
+// is complete.
+func TestDownloadObjectsTrustsTheCacheWhenTheEndpointReportsNoSize(t *testing.T) {
+	content := []byte("content")
+	oid, _ := pointerFor(content)
+
+	store := t.TempDir()
+	cached := filepath.Join(store, oid[0:2], oid[2:4])
+	if err := os.MkdirAll(cached, 0o755); err != nil {
+		t.Fatalf("prepare the store: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cached, oid), content, 0o644); err != nil {
+		t.Fatalf("place the cached object: %v", err)
+	}
+
+	expired, unavailable, failed := downloadObjects(context.Background(), newBatchClient(nil), store,
+		"http://127.0.0.1:1/repo.git/info/lfs", credentials{},
+		[]pointer{{oid: oid, size: int64(len(content))}},
+		[]batchResponseObject{{
+			OID:  oid,
+			Size: 0,
+			Actions: map[string]*batchAction{"download": {
+				Href:      "http://127.0.0.1:1/download/" + oid,
+				ExpiresAt: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+			}},
+		}})
+
+	if len(expired) != 0 {
+		t.Errorf("expired = %v, want cached content not rescheduled over an unstated size", expired)
+	}
+	if len(unavailable) != 0 || len(failed) != 0 {
+		t.Errorf("unavailable = %v, failed = %v, want cached content left alone", unavailable, failed)
+	}
+
+	// A size the endpoint does state has to be honoured, so a partial file is
+	// not mistaken for the object.
+	shortStore := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(shortStore, oid[0:2], oid[2:4]), 0o755); err != nil {
+		t.Fatalf("prepare the store: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(shortStore, oid[0:2], oid[2:4], oid), content[:3], 0o644); err != nil {
+		t.Fatalf("place the truncated object: %v", err)
+	}
+	_, _, truncatedFailed := downloadObjects(context.Background(), newBatchClient(nil), shortStore,
+		"http://127.0.0.1:1/repo.git/info/lfs", credentials{},
+		[]pointer{{oid: oid, size: int64(len(content))}},
+		[]batchResponseObject{{
+			OID:  oid,
+			Size: int64(len(content)),
+			Actions: map[string]*batchAction{"download": {
+				Href: "http://127.0.0.1:1/download/" + oid,
+			}},
+		}})
+	if len(truncatedFailed) == 0 {
+		t.Error("a cached file the endpoint's size contradicts should fall through to a download")
+	}
+}
+
 func TestFetchAllUnauthorizedIsNotDisabled(t *testing.T) {
 	oid, pointerText := pointerFor([]byte("content"))
 	lfsServer := newFakeLFSServer(t, map[string][]byte{oid: []byte("content")})
