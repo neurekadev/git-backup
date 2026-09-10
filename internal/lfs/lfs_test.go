@@ -976,6 +976,23 @@ func TestDownloadObjectsTrustsTheCacheWhenTheEndpointReportsNoSize(t *testing.T)
 	if len(truncatedFailed) == 0 {
 		t.Error("a cached file the endpoint's size contradicts should fall through to a download")
 	}
+
+	// The pointer file's size is authoritative, so a truncated file is not the
+	// object even when the endpoint states no size at all — the case that would
+	// otherwise let an interrupted copy be counted as mirrored.
+	_, _, unstatedFailed := downloadObjects(context.Background(), newBatchClient(nil), shortStore,
+		"http://127.0.0.1:1/repo.git/info/lfs", credentials{},
+		[]pointer{{oid: oid, size: int64(len(content))}},
+		[]batchResponseObject{{
+			OID:  oid,
+			Size: 0,
+			Actions: map[string]*batchAction{"download": {
+				Href: "http://127.0.0.1:1/download/" + oid,
+			}},
+		}})
+	if len(unstatedFailed) == 0 {
+		t.Error("a cached file the pointer's size contradicts should fall through to a download")
+	}
 }
 
 func TestFetchAllUnauthorizedIsNotDisabled(t *testing.T) {

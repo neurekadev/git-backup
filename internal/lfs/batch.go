@@ -336,8 +336,10 @@ func downloadObjects(
 	// a SHA-256 digest — is refused before any of that: a short OID would panic
 	// the slice, and a crafted one could name a path outside the store.
 	requested := make(map[string]bool, len(want))
+	wantSize := make(map[string]int64, len(want))
 	for _, pointer := range want {
 		requested[pointer.oid] = true
+		wantSize[pointer.oid] = pointer.size
 	}
 	// answered also returns the canonical spelling of the object's OID: the
 	// pointer's OIDs are lowercase, while an endpoint may echo a valid digest in
@@ -370,16 +372,23 @@ func downloadObjects(
 			unavailable = append(unavailable, refused)
 			continue
 		}
+		// The pointer file's own size is authoritative, since it is what the
+		// repository records about the object; the endpoint's stands in only
+		// when the pointer did not state one.
+		size := object.Size
+		if wanted, known := wantSize[oid]; known && wanted > 0 {
+			size = wanted
+		}
 		if cached, err := os.Stat(filepath.Join(store, oid[0:2], oid[2:4], oid)); err == nil &&
-			cached.Mode().IsRegular() && (object.Size == 0 || cached.Size() == object.Size) {
+			cached.Mode().IsRegular() && (size == 0 || cached.Size() == size) {
 			// Already cached by a previous snapshot; git-lfs also skips it, and
 			// content already held needs no fresh URL, so this is settled before
 			// the expiry below can send it back for rescheduling. A file of a
-			// length the endpoint contradicts is not this object, so it falls
-			// through to the download, which verifies the digest as bytes
-			// arrive. An endpoint that reports no size leaves the length
-			// unstated rather than contradicted, and re-downloading content the
-			// store already holds would risk failing over it.
+			// length the recorded size contradicts is not this object, so it
+			// falls through to the download, which verifies the digest as bytes
+			// arrive. No size anywhere leaves the length unstated rather than
+			// contradicted, and re-downloading content the store already holds
+			// would risk failing over it.
 			continue
 		}
 		action := object.Actions["download"]
