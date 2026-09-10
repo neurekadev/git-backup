@@ -20,6 +20,21 @@ type pointer struct {
 	size int64
 }
 
+// skippedSubtree records a subtree the scan could not read, so its pointers are
+// known to be missing from the result rather than silently absent.
+type skippedSubtree struct {
+	name string
+	hash plumbing.Hash
+	err  error
+}
+
+// scanResult is what one scan of a repository found: the pointers it collected
+// and the subtrees it could not read.
+type scanResult struct {
+	pointers []pointer
+	skipped  []skippedSubtree
+}
+
 // pointerVersionValue is the version scheme URI on the first line of every
 // LFS pointer file.
 const pointerVersionValue = "https://git-lfs.github.com/spec/v1"
@@ -32,12 +47,13 @@ const pointerMaxBytes = 4 * 1024
 // inspected once. Commit history is traversed explicitly (rather than per-ref
 // iterators) so a repository with many refs costs one pass over its history,
 // not one per ref.
-func collectPointers(ctx context.Context, repository *git.Repository) ([]pointer, error) {
+func collectPointers(ctx context.Context, repository *git.Repository) (scanResult, error) {
 	seenCommits := make(map[plumbing.Hash]struct{})
 	seenTrees := make(map[plumbing.Hash]bool)
 	seenBlobs := make(map[plumbing.Hash]struct{})
 
 	var pointers []pointer
+	var skipped []skippedSubtree
 	seenPointers := make(map[string]struct{})
 
 	enqueue := func(queue []plumbing.Hash, hash plumbing.Hash) []plumbing.Hash {
@@ -53,7 +69,7 @@ func collectPointers(ctx context.Context, repository *git.Repository) ([]pointer
 	queue := make([]plumbing.Hash, 0, 64)
 	refs, err := repository.References()
 	if err != nil {
-		return nil, err
+		return scanResult{}, err
 	}
 	err = refs.ForEach(func(ref *plumbing.Reference) error {
 		if ref.Type() == plumbing.SymbolicReference || ref.Name().IsRemote() {
@@ -63,12 +79,12 @@ func collectPointers(ctx context.Context, repository *git.Repository) ([]pointer
 		return ctx.Err()
 	})
 	if err != nil {
-		return nil, err
+		return scanResult{}, err
 	}
 
 	for len(queue) > 0 {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return scanResult{}, err
 		}
 
 		hash := queue[len(queue)-1]
@@ -86,8 +102,8 @@ func collectPointers(ctx context.Context, repository *git.Repository) ([]pointer
 			continue
 		}
 
-		if err := scanTree(repository, commit.TreeHash, seenTrees, seenBlobs, seenPointers, &pointers); err != nil {
-			return nil, err
+		if err := scanTree(repository, commit.TreeHash, seenTrees, seenBlobs, seenPointers, &skipped, &pointers); err != nil {
+			return scanResult{}, err
 		}
 
 		for _, parent := range commit.ParentHashes {
@@ -95,7 +111,7 @@ func collectPointers(ctx context.Context, repository *git.Repository) ([]pointer
 		}
 	}
 
-	return pointers, nil
+	return scanResult{pointers: pointers, skipped: skipped}, nil
 }
 
 // peelToCommitHash resolves a ref tip hash to the commit it designates,
@@ -137,6 +153,7 @@ func scanTree(
 	treeHash plumbing.Hash,
 	seenTrees map[plumbing.Hash]bool, seenBlobs map[plumbing.Hash]struct{},
 	seenPointers map[string]struct{},
+	skipped *[]skippedSubtree,
 	pointers *[]pointer,
 ) error {
 	tree, err := repository.TreeObject(treeHash)
@@ -161,7 +178,9 @@ func scanTree(
 				subtree, err := repository.TreeObject(entry.Hash)
 				if err != nil {
 					// A subtree missing from a partial fetch costs its
-					// pointers but leaves the rest of the scan intact.
+					// pointers but leaves the rest of the scan intact; record
+					// it so the loss is reported rather than silent.
+					*skipped = append(*skipped, skippedSubtree{name: entry.Name, hash: entry.Hash, err: err})
 					continue
 				}
 				pending = append(pending, subtree)
@@ -177,6 +196,9 @@ func scanTree(
 
 			blob, err := repository.BlobObject(entry.Hash)
 			if err != nil {
+				// A blob missing from a partial fetch costs whatever pointer it
+				// held; record it so the loss is reported rather than silent.
+				*skipped = append(*skipped, skippedSubtree{name: entry.Name, hash: entry.Hash, err: err})
 				continue
 			}
 			if blob.Size > pointerMaxBytes {
@@ -185,11 +207,13 @@ func scanTree(
 
 			reader, err := blob.Reader()
 			if err != nil {
+				*skipped = append(*skipped, skippedSubtree{name: entry.Name, hash: entry.Hash, err: err})
 				continue
 			}
 			content, err := io.ReadAll(io.LimitReader(reader, pointerMaxBytes))
 			_ = reader.Close()
 			if err != nil {
+				*skipped = append(*skipped, skippedSubtree{name: entry.Name, hash: entry.Hash, err: err})
 				continue
 			}
 

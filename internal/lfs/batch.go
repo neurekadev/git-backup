@@ -92,10 +92,15 @@ func newBatchClient(client *http.Client) *batchClient {
 
 const lfsMediaType = "application/vnd.git-lfs+json"
 
-// batch submits every pointer for download scheduling. A 403 or 404 from the
-// endpoint means the remote has Git LFS switched off, which callers treat as
-// an expected skip rather than a failure. Any other unexpected status is
-// reported as errBatchRejected so callers can retry the pointers individually.
+// batch submits every pointer for download scheduling.
+//
+// A 403 means the remote has Git LFS switched off, which callers treat as an
+// expected skip rather than a failure. A 404 means the LFS service answered
+// about an object it does not have, which callers record per object. A status
+// describing the request's shape is reported as errBatchRejected so callers can
+// retry the pointers in smaller batches; every other status describes the
+// endpoint rather than what was asked of it, so splitting the chunk would only
+// repeat the same answer more slowly.
 func (c *batchClient) batch(ctx context.Context, endpoint, username, password string, pointers []pointer) ([]batchResponseObject, error) {
 	body, err := json.Marshal(batchRequest{
 		Operation: "download",
@@ -122,13 +127,27 @@ func (c *batchClient) batch(ctx context.Context, endpoint, username, password st
 	}
 	defer drainAndClose(response)
 
-	switch response.StatusCode {
-	case http.StatusOK:
+	if response.StatusCode == http.StatusForbidden {
+		// A forge that has LFS switched off answers 403 with an explanation,
+		// while a path with nothing mounted behind it answers 403 only if the
+		// host refuses unmatched paths. The body separates the two, and the
+		// difference decides whether the repository is skipped or another
+		// candidate path is tried.
+		if body, err := io.ReadAll(io.LimitReader(response.Body, 4096)); err == nil && looksLikeJSON(body) {
+			return nil, ErrDisabled
+		}
+		return nil, ErrNoEndpoint
+	}
+	switch {
+	case response.StatusCode == http.StatusOK:
 		// Handled below.
-	case http.StatusForbidden, http.StatusNotFound:
-		return nil, ErrDisabled
-	default:
+	case response.StatusCode == http.StatusNotFound:
+		// No LFS action answered at this path, which another candidate may.
+		return nil, ErrNoEndpoint
+	case describesRequestShape(response.StatusCode):
 		return nil, fmt.Errorf("%w: status %d", errBatchRejected, response.StatusCode)
+	default:
+		return nil, fmt.Errorf("batch request failed with status %d", response.StatusCode)
 	}
 
 	var decoded batchResponse
@@ -141,36 +160,73 @@ func (c *batchClient) batch(ctx context.Context, endpoint, username, password st
 	return decoded.Objects, nil
 }
 
+// describesRequestShape reports whether a status is how servers answer a request
+// they will not process as sent, which a smaller batch may avoid: an unprocessable
+// entity, a payload the server considers too large, or a body it cannot accept.
+// Credentials, rate limiting, and the endpoint's own failures are not among them.
+func describesRequestShape(status int) bool {
+	switch status {
+	case http.StatusBadRequest,
+		http.StatusRequestEntityTooLarge,
+		http.StatusUnprocessableEntity,
+		http.StatusNotAcceptable,
+		http.StatusUnsupportedMediaType:
+		return true
+	default:
+		return false
+	}
+}
+
+// looksLikeJSON reports whether a body is a JSON document, which is how the LFS
+// batch API explains itself and how an HTML error page does not.
+func looksLikeJSON(body []byte) bool {
+	trimmed := bytes.TrimSpace(body)
+	return len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
+}
+
 // downloadObjects streams each scheduled object into the repository's LFS
 // cache, verifying its SHA-256 as bytes arrive. Objects already cached are
 // skipped, so repeated snapshots only download new content.
+//
+// Every object is attempted whatever the others did, so one bad pointer or one
+// transient transfer failure cannot hide its siblings. What failed comes back in
+// the two lists: unavailable for objects the endpoint will not serve, and failed
+// for objects this client could not transfer — a corrupt body, a broken
+// connection — which the caller reports rather than recording as the endpoint's
+// refusal.
 func downloadObjects(
 	ctx context.Context,
 	client *batchClient,
 	store, endpoint, username, password string,
 	objects []batchResponseObject,
-) error {
+) (unavailable []*batchObjectError, failed []error) {
 	endpointHost := hostOf(endpoint)
-	for _, object := range objects {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if object.Error != nil {
+	answered := func(object batchResponseObject) *batchObjectError {
+		switch {
+		case object.Error != nil:
 			return &batchObjectError{oid: object.OID, message: object.Error.Message}
-		}
-
-		action := object.Actions["download"]
-		if action == nil || action.Href == "" {
-			// The server knows the object but scheduled nothing; without a
+		case object.Actions["download"] == nil || object.Actions["download"].Href == "":
+			// The server knows the object but scheduled nothing; without an
 			// href there is nothing this client can do beyond reporting it.
 			return &batchObjectError{oid: object.OID, message: "no download action was scheduled"}
-		}
-
-		if err := downloadObject(ctx, client.client, store, endpointHost, username, password, object.OID, action); err != nil {
-			return err
+		default:
+			return nil
 		}
 	}
-	return nil
+
+	for _, object := range objects {
+		if err := ctx.Err(); err != nil {
+			return unavailable, append(failed, err)
+		}
+		if refused := answered(object); refused != nil {
+			unavailable = append(unavailable, refused)
+			continue
+		}
+		if err := downloadObject(ctx, client.client, store, endpointHost, username, password, object.OID, object.Actions["download"]); err != nil {
+			failed = append(failed, err)
+		}
+	}
+	return unavailable, failed
 }
 
 func downloadObject(
