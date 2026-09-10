@@ -92,15 +92,69 @@ func newBatchClient(client *http.Client) *batchClient {
 
 const lfsMediaType = "application/vnd.git-lfs+json"
 
+// probe asks an endpoint for one object to find out whether it serves this
+// repository's LFS API at all. Discovery happens once, before any object is
+// fetched, so the fetch itself runs against a single known-good endpoint: the
+// answer separates "the API answered for this object" — including that the
+// server does not have it — from "LFS is switched off here" and from "nothing is
+// mounted at this path".
+//
+// A single object keeps the probe from tripping a server's object limit, so a
+// refused probe is about the path rather than the request's shape. A nil return
+// therefore means the API root is right, and the object's own fate is the
+// fetch's business.
+func (c *batchClient) probe(ctx context.Context, endpoint, username, password string, object pointer) error {
+	body, err := json.Marshal(batchRequest{
+		Operation: "download",
+		Transfers: []string{"basic"},
+		Objects:   toBatchObjects([]pointer{object}),
+	})
+	if err != nil {
+		return err
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/objects/batch", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", lfsMediaType)
+	request.Header.Set("Accept", lfsMediaType)
+	if username != "" || password != "" {
+		request.SetBasicAuth(username, password)
+	}
+
+	response, err := c.client.Do(request)
+	if err != nil {
+		return fmt.Errorf("batch request: %w", err)
+	}
+	defer drainAndClose(response)
+
+	switch response.StatusCode {
+	case http.StatusOK:
+		// The API answered for the object, whether by scheduling it or by
+		// reporting that the server does not have it.
+		return nil
+	case http.StatusForbidden:
+		// The forge has LFS switched off for this repository.
+		return ErrDisabled
+	case http.StatusNotFound, http.StatusUnprocessableEntity:
+		// Nothing is mounted at this path: a host that routes by path answers
+		// 404, and one that validates the action answers a single-object
+		// request with 422.
+		return ErrNoEndpoint
+	default:
+		return fmt.Errorf("batch request failed with status %d", response.StatusCode)
+	}
+}
+
 // batch submits every pointer for download scheduling.
 //
-// A 403 means the remote has Git LFS switched off, which callers treat as an
-// expected skip rather than a failure. A 404 means the LFS service answered
-// about an object it does not have, which callers record per object. A status
-// describing the request's shape is reported as errBatchRejected so callers can
-// retry the pointers in smaller batches; every other status describes the
-// endpoint rather than what was asked of it, so splitting the chunk would only
-// repeat the same answer more slowly.
+// A status describing the request's shape is reported as errBatchRejected so
+// callers can retry the pointers in smaller batches; every other status
+// describes the endpoint rather than what was asked of it, so splitting the
+// chunk would only repeat the same answer more slowly. Discovery already
+// established which endpoint serves the API, so a 403 or 404 here describes a
+// service that has stopped answering rather than a path worth retrying.
 func (c *batchClient) batch(ctx context.Context, endpoint, username, password string, pointers []pointer) ([]batchResponseObject, error) {
 	body, err := json.Marshal(batchRequest{
 		Operation: "download",
@@ -127,23 +181,9 @@ func (c *batchClient) batch(ctx context.Context, endpoint, username, password st
 	}
 	defer drainAndClose(response)
 
-	if response.StatusCode == http.StatusForbidden {
-		// A forge that has LFS switched off answers 403 with an explanation,
-		// while a path with nothing mounted behind it answers 403 only if the
-		// host refuses unmatched paths. The body separates the two, and the
-		// difference decides whether the repository is skipped or another
-		// candidate path is tried.
-		if body, err := io.ReadAll(io.LimitReader(response.Body, 4096)); err == nil && looksLikeJSON(body) {
-			return nil, ErrDisabled
-		}
-		return nil, ErrNoEndpoint
-	}
 	switch {
 	case response.StatusCode == http.StatusOK:
 		// Handled below.
-	case response.StatusCode == http.StatusNotFound:
-		// No LFS action answered at this path, which another candidate may.
-		return nil, ErrNoEndpoint
 	case describesRequestShape(response.StatusCode):
 		return nil, fmt.Errorf("%w: status %d", errBatchRejected, response.StatusCode)
 	default:
@@ -177,29 +217,22 @@ func describesRequestShape(status int) bool {
 	}
 }
 
-// looksLikeJSON reports whether a body is a JSON document, which is how the LFS
-// batch API explains itself and how an HTML error page does not.
-func looksLikeJSON(body []byte) bool {
-	trimmed := bytes.TrimSpace(body)
-	return len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
-}
-
 // downloadObjects streams each scheduled object into the repository's LFS
 // cache, verifying its SHA-256 as bytes arrive. Objects already cached are
 // skipped, so repeated snapshots only download new content.
 //
 // Every object is attempted whatever the others did, so one bad pointer or one
 // transient transfer failure cannot hide its siblings. What failed comes back in
-// the two lists: unavailable for objects the endpoint will not serve, and failed
-// for objects this client could not transfer — a corrupt body, a broken
-// connection — which the caller reports rather than recording as the endpoint's
-// refusal.
+// the three lists: cached for objects already in the cache, unavailable for
+// objects the endpoint will not serve, and failed for objects this client could
+// not transfer — a corrupt body, a broken connection — which the caller reports
+// rather than recording as the endpoint's refusal.
 func downloadObjects(
 	ctx context.Context,
 	client *batchClient,
 	store, endpoint, username, password string,
 	objects []batchResponseObject,
-) (unavailable []*batchObjectError, failed []error) {
+) (cached, unavailable []*batchObjectError, failed []error) {
 	endpointHost := hostOf(endpoint)
 	answered := func(object batchResponseObject) *batchObjectError {
 		switch {
@@ -216,34 +249,44 @@ func downloadObjects(
 
 	for _, object := range objects {
 		if err := ctx.Err(); err != nil {
-			return unavailable, append(failed, err)
+			return cached, unavailable, append(failed, err)
 		}
 		if refused := answered(object); refused != nil {
 			unavailable = append(unavailable, refused)
 			continue
 		}
-		if err := downloadObject(ctx, client.client, store, endpointHost, username, password, object.OID, object.Actions["download"]); err != nil {
+		stored, err := downloadObject(ctx, client.client, store, endpointHost, username, password, object.OID, object.Actions["download"])
+		switch {
+		case err != nil:
 			failed = append(failed, err)
+		case stored:
+			// Already in the cache: the endpoint answered for it, but this
+			// request never streamed it.
+			cached = append(cached, &batchObjectError{oid: object.OID, message: "already in the local cache"})
 		}
 	}
-	return unavailable, failed
+	return cached, unavailable, failed
 }
 
+// downloadObject streams one object into the LFS cache, verifying its SHA-256 as
+// bytes arrive. It reports whether the object was already cached, so a caller can
+// tell an endpoint that streamed the bytes from one that merely answered for
+// them.
 func downloadObject(
 	ctx context.Context,
 	client *http.Client,
 	store, endpointHost, username, password, oid string,
 	action *batchAction,
-) error {
+) (bool, error) {
 	destination := filepath.Join(store, oid[0:2], oid[2:4], oid)
 	if _, err := os.Stat(destination); err == nil {
 		// Already cached by a previous snapshot; git-lfs also skips it.
-		return nil
+		return true, nil
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, action.Href, nil)
 	if err != nil {
-		return fmt.Errorf("LFS object %s: %w", shortOID(oid), err)
+		return false, fmt.Errorf("LFS object %s: %w", shortOID(oid), err)
 	}
 	for key, value := range action.Header {
 		request.Header.Set(key, value)
@@ -257,21 +300,21 @@ func downloadObject(
 
 	response, err := client.Do(request)
 	if err != nil {
-		return fmt.Errorf("LFS object %s: %w", shortOID(oid), err)
+		return false, fmt.Errorf("LFS object %s: %w", shortOID(oid), err)
 	}
 	defer drainAndClose(response)
 
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("LFS object %s download failed with status %d", shortOID(oid), response.StatusCode)
+		return false, fmt.Errorf("LFS object %s download failed with status %d", shortOID(oid), response.StatusCode)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
-		return fmt.Errorf("create LFS cache directory: %w", err)
+		return false, fmt.Errorf("create LFS cache directory: %w", err)
 	}
 
 	temp, err := os.CreateTemp(filepath.Dir(destination), ".lfs-download-*")
 	if err != nil {
-		return fmt.Errorf("create LFS temp file: %w", err)
+		return false, fmt.Errorf("create LFS temp file: %w", err)
 	}
 	tempName := temp.Name()
 
@@ -280,24 +323,24 @@ func downloadObject(
 	closeErr := temp.Close()
 	if copyErr != nil {
 		_ = os.Remove(tempName)
-		return fmt.Errorf("LFS object %s: %w", shortOID(oid), copyErr)
+		return false, fmt.Errorf("LFS object %s: %w", shortOID(oid), copyErr)
 	}
 	if closeErr != nil {
 		_ = os.Remove(tempName)
-		return fmt.Errorf("LFS object %s: %w", shortOID(oid), closeErr)
+		return false, fmt.Errorf("LFS object %s: %w", shortOID(oid), closeErr)
 	}
 
 	if actual := hex.EncodeToString(hash.Sum(nil)); actual != oid {
 		_ = os.Remove(tempName)
-		return fmt.Errorf("LFS object %s content hash mismatch", shortOID(oid))
+		return false, fmt.Errorf("LFS object %s content hash mismatch", shortOID(oid))
 	}
 
 	if err := os.Rename(tempName, destination); err != nil {
 		_ = os.Remove(tempName)
-		return fmt.Errorf("store LFS object %s: %w", shortOID(oid), err)
+		return false, fmt.Errorf("store LFS object %s: %w", shortOID(oid), err)
 	}
 	_ = size
-	return nil
+	return false, nil
 }
 
 func toBatchObjects(pointers []pointer) []batchObject {

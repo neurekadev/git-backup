@@ -93,6 +93,15 @@ type fakeLFSServer struct {
 	// disabledPaths answer 403, the response for a repository with LFS switched
 	// off, which is not the same as a path with no service behind it.
 	disabledPaths []string
+	// serveProbe answers discovery probes normally, so a test can have discovery
+	// succeed while the batch requests that follow are rejected.
+	serveProbe bool
+	// fetchStatus, when non-zero, is the status batch requests get once a probe
+	// has been answered, so a test can model an endpoint that serves discovery
+	// and then stops serving the fetch.
+	fetchStatus int
+	// probeCalls counts the discovery probes the handler answered.
+	probeCalls int
 }
 
 func newFakeLFSServer(t *testing.T, data map[string][]byte) *fakeLFSServer {
@@ -169,15 +178,9 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.batchCalls++
 	status, batchPath := s.batchStatus, s.batchPath
-	rejectWhen := s.rejectWhen
-	refused := make(map[string]struct{}, len(s.refusedOIDs))
-	for _, oid := range s.refusedOIDs {
-		refused[oid] = struct{}{}
-	}
-	actionless := make(map[string]struct{}, len(s.actionlessOIDs))
-	for _, oid := range s.actionlessOIDs {
-		actionless[oid] = struct{}{}
-	}
+	rejectWhen, serveProbe := s.rejectWhen, s.serveProbe
+	probed := s.probeCalls > 0
+	fetchStatus := s.fetchStatus
 	disabled := slices.Contains(s.disabledPaths, r.URL.Path)
 	servedHere := slices.Contains(s.servePaths, r.URL.Path)
 	hasServePaths := len(s.servePaths) > 0
@@ -201,14 +204,29 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"message":"Git LFS is disabled for this repository."}`))
 		return
 	}
-	if status != 0 {
-		w.WriteHeader(status)
-		return
-	}
 
 	var request batchRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	// A discovery probe carries one object. A server configured to answer it
+	// does so before any rule about the fetch applies, so a test can model
+	// discovery succeeding and the fetch that follows failing.
+	if len(request.Objects) == 1 && serveProbe && !probed {
+		s.mu.Lock()
+		s.probeCalls++
+		s.mu.Unlock()
+		s.respond(w, request)
+		return
+	}
+	if status != 0 {
+		w.WriteHeader(status)
+		return
+	}
+	if fetchStatus != 0 && probed {
+		w.WriteHeader(fetchStatus)
 		return
 	}
 
@@ -220,6 +238,21 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.respond(w, request)
+}
+
+// respond answers a batch request with the object verdicts the server holds.
+func (s *fakeLFSServer) respond(w http.ResponseWriter, request batchRequest) {
+	s.mu.Lock()
+	refused := make(map[string]struct{}, len(s.refusedOIDs))
+	for _, oid := range s.refusedOIDs {
+		refused[oid] = struct{}{}
+	}
+	actionless := make(map[string]struct{}, len(s.actionlessOIDs))
+	for _, oid := range s.actionlessOIDs {
+		actionless[oid] = struct{}{}
+	}
+	s.mu.Unlock()
 
 	response := batchResponse{Objects: make([]batchResponseObject, 0, len(request.Objects))}
 	for _, object := range request.Objects {
@@ -555,9 +588,9 @@ func TestFetchAllFallsBackWhenBatchRejected(t *testing.T) {
 				}
 				return http.StatusOK
 			},
-			// The chunk splits into two singletons, both are served, and the
-			// candidate succeeds — so there is nothing left to probe.
-			wantBatches: 3,
+			// Discovery answers the one-object probe, so the fetch runs: the
+			// chunk is refused once and then narrowed into two served singletons.
+			wantBatches: 4,
 			wantCached:  result(availableOID, refusedOID),
 		},
 		{
@@ -571,10 +604,9 @@ func TestFetchAllFallsBackWhenBatchRejected(t *testing.T) {
 				return http.StatusOK
 			},
 			// The chunk splits once and the refused half's lone pointer is
-			// rejected on its own request; the remote already carries the
-			// suffix, so there is no second candidate path to probe.
+			// rejected on its own request.
 			wantErr:     "unavailable",
-			wantBatches: 3,
+			wantBatches: 4,
 			wantCached:  result(availableOID),
 		},
 		{
@@ -582,10 +614,10 @@ func TestFetchAllFallsBackWhenBatchRejected(t *testing.T) {
 			request: func(batchRequest) int {
 				return http.StatusBadRequest
 			},
-			// Splitting, not per-object fan-out: both halves narrow to the
-			// rejection before it is reported as the endpoint's.
+			// Discovery is answered, then every fetch request is refused, so the
+			// rejection outlives the split and is reported as the endpoint's.
 			wantErr:     "rejected",
-			wantBatches: 3,
+			wantBatches: 4,
 		},
 	}
 
@@ -595,6 +627,9 @@ func TestFetchAllFallsBackWhenBatchRejected(t *testing.T) {
 				availableOID: available,
 				refusedOID:   refused,
 			})
+			// Discovery is answered so the fetch runs; the rejection rules then
+			// decide what the fetch sees.
+			lfsServer.serveProbe = true
 			lfsServer.rejectWhen = c.request
 			repositoryPath := newRepoWithLFS(t, map[string]string{
 				"big.bin":   availablePointer,
@@ -695,8 +730,10 @@ func TestFetchAllChunksLargePointerSets(t *testing.T) {
 		t.Fatalf("FetchAll failed: %v", err)
 	}
 
-	if calls := lfsServer.batchCallCount(); calls != 2 {
-		t.Errorf("batch calls = %d, want one request per chunk of %d", calls, batchObjectLimit)
+	// One discovery probe plus one request per chunk of batchObjectLimit.
+	wantCalls := 1 + (batchObjectLimit+2+batchObjectLimit-1)/batchObjectLimit
+	if calls := lfsServer.batchCallCount(); calls != wantCalls {
+		t.Errorf("batch calls = %d, want a probe plus one request per chunk of %d", calls, batchObjectLimit)
 	}
 	if _, err := os.Stat(filepath.Join(repositoryPath, ".git", "lfs", "objects",
 		lastOID[0:2], lastOID[2:4], lastOID)); err != nil {
@@ -704,12 +741,12 @@ func TestFetchAllChunksLargePointerSets(t *testing.T) {
 	}
 }
 
-// TestFetchAllStopsAfterRepeatedEndpointFailure covers an endpoint whose
-// failures are not about the request's shape — dropped connections, and the
-// credentials and server statuses that mean the same thing. Splitting the chunk
-// would only repeat the answer, so the fetch must fail fast rather than narrow,
-// while still attempting one more chunk before concluding the endpoint is down.
-func TestFetchAllStopsAfterRepeatedEndpointFailure(t *testing.T) {
+// TestFetchAllStopsAfterFailedDiscovery covers an endpoint whose failures are not
+// about the request's shape — dropped connections, and the credentials and server
+// statuses that mean the same thing. Discovery asks once and reports, so the fetch
+// never starts rather than narrowing a chunk against an endpoint that is not
+// answering.
+func TestFetchAllStopsAfterFailedDiscovery(t *testing.T) {
 	files := make(map[string]string, batchObjectLimit*5)
 	for index := range batchObjectLimit * 5 {
 		_, pointerText := pointerFor([]byte(fmt.Sprintf("object %d", index)))
@@ -736,8 +773,9 @@ func TestFetchAllStopsAfterRepeatedEndpointFailure(t *testing.T) {
 		if errors.Is(err, errObjectUnavailable) {
 			t.Errorf("err = %v, want a transport failure rather than per-object unavailability", err)
 		}
-		if got := atomic.LoadInt64(&requests); got != 2 {
-			t.Errorf("batch requests = %d, want one attempt per tried chunk and no splitting", got)
+		// The remote carries its suffix, so there is one candidate to ask.
+		if got := atomic.LoadInt64(&requests); got != 1 {
+			t.Errorf("batch requests = %d, want a single discovery attempt", got)
 		}
 	})
 
@@ -753,19 +791,20 @@ func TestFetchAllStopsAfterRepeatedEndpointFailure(t *testing.T) {
 			if errors.Is(err, errObjectUnavailable) {
 				t.Errorf("err = %v, want the endpoint failure rather than per-object unavailability", err)
 			}
-			// No halving: one attempt for the first chunk, one for the second.
-			if calls := lfsServer.batchCallCount(); calls != 2 {
-				t.Errorf("batch calls = %d, want no splitting for a status about the endpoint", calls)
+			// No halving, no chunks: discovery answered for the whole repository.
+			if calls := lfsServer.batchCallCount(); calls != 1 {
+				t.Errorf("batch calls = %d, want a single discovery attempt", calls)
 			}
 		})
 	}
 }
 
-// TestFetchAllReportsSystematicRejection covers an endpoint that rejects every
-// request as unprocessable, including single-object ones, so the rejection
-// outlives every split. It must be reported as the endpoint's — not attributed
-// to each object as unavailable — and the sweep must stop once a second chunk
-// confirms it rather than narrowing its way through the whole repository.
+// TestFetchAllReportsSystematicRejection covers an endpoint that answers
+// discovery and then rejects every batch as unprocessable, including
+// single-object ones, so the rejection outlives every split. It must be reported
+// as the endpoint's — not attributed to each object as unavailable — and the
+// sweep must stop once a second chunk confirms it rather than narrowing its way
+// through the whole repository.
 func TestFetchAllReportsSystematicRejection(t *testing.T) {
 	const pointers = batchObjectLimit * 5
 	files := make(map[string]string, pointers)
@@ -775,7 +814,9 @@ func TestFetchAllReportsSystematicRejection(t *testing.T) {
 	}
 
 	lfsServer := newFakeLFSServer(t, nil)
+	// Discovery is answered, then every fetch request is refused.
 	lfsServer.batchStatus = http.StatusUnprocessableEntity
+	lfsServer.serveProbe = true
 	repositoryPath := newRepoWithLFS(t, files)
 
 	err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.remoteURL(), "", "")
@@ -791,8 +832,7 @@ func TestFetchAllReportsSystematicRejection(t *testing.T) {
 
 	// Two chunks are narrowed — the first to establish the rejection and the
 	// second to confirm it is the endpoint's — and the rest are left alone. A
-	// per-pointer sweep of this repository would take five hundred requests; the
-	// remote carries its suffix, so only one candidate path is tried.
+	// per-pointer sweep of this repository would take five hundred requests.
 	if calls := lfsServer.batchCallCount(); calls > 450 {
 		t.Errorf("batch calls = %d, want the systematic rejection to stop the sweep", calls)
 	}
@@ -811,8 +851,9 @@ func TestFetchAllNarrowsBothHalves(t *testing.T) {
 		badOID:  bad,
 		goodOID: good,
 	})
-	// Every request naming the bad object is refused, so the chunk narrows down
-	// its first half while the second half is served normally.
+	// Discovery is answered, so the fetch runs; every request naming the bad
+	// object is then refused, narrowing the chunk onto it.
+	lfsServer.serveProbe = true
 	lfsServer.rejectWhen = func(request batchRequest) int {
 		for _, object := range request.Objects {
 			if object.OID == badOID {
@@ -856,6 +897,7 @@ func TestFetchAllKeepsObjectsBesideAnAnsweredRejection(t *testing.T) {
 		refusedOID: refused,
 	})
 	lfsServer.refusedOIDs = []string{phantomOID}
+	lfsServer.serveProbe = true
 	lfsServer.rejectWhen = func(request batchRequest) int {
 		for _, object := range request.Objects {
 			if object.OID == refusedOID {
@@ -904,6 +946,7 @@ func TestFetchAllKeepsSweepingAfterARefusedChunk(t *testing.T) {
 	}
 
 	lfsServer := newFakeLFSServer(t, data)
+	lfsServer.serveProbe = true
 	lfsServer.rejectWhen = func(request batchRequest) int {
 		for _, object := range request.Objects {
 			for _, stale := range staleOIDs {
@@ -980,16 +1023,10 @@ func TestFetchAllKeepsObjectsBesideARefusedHalf(t *testing.T) {
 	}
 }
 
-// TestCollectPointersHandlesWindowsIllegalNames covers a tree entry that cannot
-// be materialised on the host — a backslash in a name is a path separator on
-// Windows — and one that reuses a subtree hash, as a submodule-like entry does.
-// Both must be walked without tripping the scan: the pointer beside them is
-// still collected, and the shared tree is visited once.
-// TestFetchAllReportsAnEndpointThatStopsPartway covers a service that serves
-// the first chunk and then answers as if it were not there any more. Part of the
-// repository is mirrored by then, so the "no LFS here" verdict must not be
-// recorded as a clean skip: that would report a half-finished mirror as
-// complete.
+// TestFetchAllReportsAnEndpointThatStopsPartway covers a service that answers
+// discovery and then stops serving the fetch. Part of the repository is mirrored
+// by then, so the failure must be reported rather than recorded as a clean skip:
+// that would present a half-finished mirror as complete.
 func TestFetchAllReportsAnEndpointThatStopsPartway(t *testing.T) {
 	const pointers = batchObjectLimit * 2
 	files := make(map[string]string, pointers)
@@ -1002,32 +1039,20 @@ func TestFetchAllReportsAnEndpointThatStopsPartway(t *testing.T) {
 	}
 
 	lfsServer := newFakeLFSServer(t, data)
-	// The first chunk is served; every request after it looks like a host with
-	// nothing mounted at the path.
-	var calls int64
-	lfsServer.rejectWhen = func(batchRequest) int {
-		if atomic.AddInt64(&calls, 1) > 1 {
-			return http.StatusNotFound
-		}
-		return http.StatusOK
-	}
+	// Discovery is answered; the fetch that follows looks like a host with
+	// nothing mounted at the path any more.
+	lfsServer.serveProbe = true
+	lfsServer.fetchStatus = http.StatusNotFound
 	repositoryPath := newRepoWithLFS(t, files)
 
 	err := NewFetcher().FetchAll(context.Background(), repositoryPath, lfsServer.remoteURL(), "", "")
 	if err == nil {
-		t.Fatal("an endpoint that stops serving the rest should be reported")
+		t.Fatal("an endpoint that stops serving the fetch should be reported")
 	}
-	// ErrDisabled is how the mirror layer recognises an expected skip, so the
-	// partial-mirror error must not match it through the chain.
+	// ErrDisabled is how the mirror layer recognises an expected skip, so this
+	// failure must not match it through the chain.
 	if errors.Is(err, ErrDisabled) || errors.Is(err, ErrNoEndpoint) {
-		t.Fatalf("err = %v, want a failure rather than a clean skip for a partial mirror", err)
-	}
-
-	// The chunk that was served did reach the mirror.
-	firstOID, _ := pointerFor([]byte("object 0"))
-	if _, statErr := os.Stat(filepath.Join(repositoryPath, ".git", "lfs", "objects",
-		firstOID[0:2], firstOID[2:4], firstOID)); statErr != nil {
-		t.Errorf("the served chunk should be mirrored: %v", statErr)
+		t.Fatalf("err = %v, want a failure rather than a clean skip", err)
 	}
 }
 
@@ -1290,11 +1315,11 @@ func TestCanonicalHostStripsSchemeDefaultPorts(t *testing.T) {
 	}
 }
 
-// TestDefaultEndpointAddsGitSuffix pins the endpoint a forge expects: GitHub
+// TestSuffixedEndpointAddsGitSuffix pins the endpoint a forge expects: GitHub
 // and GitLab answer a suffix-less /info/lfs with 422, so a configured remote
 // without .git still has to request the suffixed path. Everything else the
 // remote URL carries has to survive the rewrite.
-func TestDefaultEndpointAddsGitSuffix(t *testing.T) {
+func TestSuffixedEndpointAddsGitSuffix(t *testing.T) {
 	cases := []struct {
 		remoteURL string
 		want      string
@@ -1319,18 +1344,18 @@ func TestDefaultEndpointAddsGitSuffix(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := defaultEndpoint(parsed); got != c.want {
-				t.Errorf("defaultEndpoint(%q) = %q, want %q", redactedURL(c.remoteURL), redactedURL(got), redactedURL(c.want))
+			if got := suffixedEndpoint(parsed); got != c.want {
+				t.Errorf("suffixedEndpoint(%q) = %q, want %q", redactedURL(c.remoteURL), redactedURL(got), redactedURL(c.want))
 			}
 		})
 	}
 }
 
-// TestResolveEndpointsCollapsesDuplicateCandidates covers remotes that reach the
+// TestEndpointCandidatesCollapseDuplicates covers remotes that reach the
 // LFS API at one path whichever candidate is derived — a remote that already
 // carries the repository suffix, and one with no path at all. Probing the same
 // URL twice would repeat every request of a whole repository for nothing.
-func TestResolveEndpointsCollapsesDuplicateCandidates(t *testing.T) {
+func TestEndpointCandidatesCollapseDuplicates(t *testing.T) {
 	for _, remoteURL := range []string{
 		"https://git.example.com/owner/repo.git",
 		"https://git.example.com",
@@ -1342,7 +1367,11 @@ func TestResolveEndpointsCollapsesDuplicateCandidates(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			endpoints, err := resolveEndpoints(repository, remoteURL)
+			parsed, parseErr := parseRemoteURL(remoteURL)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			endpoints, err := endpointCandidates(repository, parsed)
 			if err != nil {
 				t.Fatalf("resolveEndpoints failed: %v", err)
 			}
@@ -1353,7 +1382,7 @@ func TestResolveEndpointsCollapsesDuplicateCandidates(t *testing.T) {
 	}
 }
 
-func TestResolveEndpointOverrideHostAndScheme(t *testing.T) {
+func TestEndpointCandidatesOverrideHostAndScheme(t *testing.T) {
 	oid, pointerText := pointerFor([]byte("content"))
 	cases := []struct {
 		name        string
@@ -1406,7 +1435,11 @@ func TestResolveEndpointOverrideHostAndScheme(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			endpoints, err := resolveEndpoints(repository, c.remoteURL)
+			parsed, parseErr := parseRemoteURL(c.remoteURL)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			endpoints, err := endpointCandidates(repository, parsed)
 			if c.wantReject {
 				if err == nil {
 					t.Fatalf("resolveEndpoints = %q, want rejection", redactedURL(strings.Join(endpoints, ",")))

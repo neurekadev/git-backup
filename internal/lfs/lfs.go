@@ -46,102 +46,89 @@ func NewFetcher() *Fetcher {
 // repositoryPath, using remoteURL to derive the LFS endpoint. username and
 // password authenticate the batch request only; object downloads use the
 // server-provided (typically pre-signed) URLs.
+//
+// The work splits into three steps with one job each: reject a remote URL this
+// package will not talk to, scan the mirror for pointers, settle which endpoint
+// serves this repository's LFS API, and then fetch from that endpoint alone.
+// Settling the endpoint first is what keeps the fetch simple — no fallback to
+// reconcile, and no way for a working endpoint to be mistaken for a missing one
+// partway through a repository.
 func (f *Fetcher) FetchAll(ctx context.Context, repositoryPath, remoteURL, username, password string) error {
 	repository, err := git.PlainOpen(repositoryPath)
 	if err != nil {
 		return fmt.Errorf("open repository: %w", err)
 	}
-
-	endpoints, err := resolveEndpoints(repository, remoteURL)
+	parsed, err := parseRemoteURL(remoteURL)
 	if err != nil {
 		return err
 	}
 
+	pointers, err := f.pointers(ctx, repository, remoteURL)
+	if err != nil || len(pointers) == 0 {
+		return err
+	}
+
+	candidates, err := endpointCandidates(repository, parsed)
+	if err != nil {
+		return err
+	}
+	endpoint, err := f.selectEndpoint(ctx, candidates, username, password, pointers[0])
+	if err != nil {
+		return err
+	}
+
+	store := objectStoreDir(repository, repositoryPath)
+	outcome, err := f.fetchBatches(ctx, store, endpoint, username, password, pointers)
+	if err != nil {
+		return err
+	}
+	if outcome.unavailable > 0 {
+		// The endpoint serves this repository but does not have every object a
+		// pointer names. The mirror keeps what it got; the gap is reported
+		// rather than passed over, because a mirror missing LFS content is not a
+		// complete backup.
+		slog.Warn("Some Git LFS objects could not be fetched; the repository was mirrored without them.",
+			"endpoint", redactedURL(endpoint), "objectsMissing", outcome.unavailable, "objectsRequested", len(pointers))
+		slog.Debug("Git LFS objects that could not be fetched.",
+			"endpoint", redactedURL(endpoint), "reason", outcome.skipped.Error())
+		return fmt.Errorf("%d of %d LFS objects could not be fetched: %w",
+			outcome.unavailable, len(pointers), outcome.skipped)
+	}
+	return nil
+}
+
+// parseRemoteURL rejects a remote this package will not talk to: only http and
+// https are accepted, so a provider-supplied URL can never reach a transport
+// helper or a local path.
+func parseRemoteURL(remoteURL string) (*url.URL, error) {
+	parsed, ok := paths.ParseHTTPURL(remoteURL)
+	if !ok {
+		return nil, fmt.Errorf("unsupported remote URL '%s': only http and https are allowed", redactedURL(remoteURL))
+	}
+	return parsed, nil
+}
+
+// pointers scans the mirror for the LFS pointers its refs reach, reporting the
+// parts of the repository it could not read. A scan that could not read
+// everything fails the fetch: a backup reported as complete while content it
+// could not scan is silently absent is worse than one that reports what it could
+// not do.
+func (f *Fetcher) pointers(ctx context.Context, repository *git.Repository, remoteURL string) ([]pointer, error) {
 	scan, err := collectPointers(ctx, repository)
 	if err != nil {
-		return fmt.Errorf("scan for LFS pointers: %w", err)
+		return nil, fmt.Errorf("scan for LFS pointers: %w", err)
 	}
 	if len(scan.skipped) > 0 {
-		// Whatever those objects held is missing from the mirror, so name them
-		// and fail the fetch: a backup reported as complete while LFS content is
-		// silently absent is worse than one that reports what it could not do.
 		for _, skipped := range scan.skipped {
 			slog.Warn("Could not read part of the repository while scanning for Git LFS pointers.",
 				"repository", redactedURL(remoteURL), "entry", skipped.name,
 				"oid", shortOID(skipped.hash.String()), "reason", skipped.err.Error())
 		}
-		return fmt.Errorf("%d entries could not be read while scanning for LFS pointers, so the mirror would be incomplete", len(scan.skipped))
+		return nil, fmt.Errorf("%d entries could not be read while scanning for LFS pointers, so the mirror would be incomplete", len(scan.skipped))
 	}
-	if len(scan.pointers) == 0 {
-		// Nothing to fetch; never contact the endpoint so a forge without LFS
-		// is not mistaken for one that disabled it.
-		return nil
-	}
-	pointers := scan.pointers
-
-	store := objectStoreDir(repository, repositoryPath)
-	var disabledErr, rejectedErr, hardErr error
-	for _, endpoint := range endpoints {
-		served, endpointErr := f.fetchBatches(ctx, store, endpoint, username, password, pointers)
-		if endpointErr == nil {
-			return nil
-		}
-		if served > 0 && !errors.Is(endpointErr, errObjectUnavailable) {
-			// An endpoint that already mirrored part of the repository is
-			// authoritative whatever it says afterwards: no later verdict —
-			// "LFS is off", "nothing here", a rejection — may be recorded as a
-			// clean skip, because that would report a half-finished mirror as
-			// complete. The outcome is rendered rather than wrapped, so no skip
-			// sentinel survives to be matched through the chain.
-			if hardErr == nil {
-				hardErr = fmt.Errorf("%d LFS objects were fetched before the endpoint stopped serving the rest: %v", served, endpointErr)
-			}
-			slog.Debug("Endpoint stopped serving partway through the repository.",
-				"endpoint", redactedURL(endpoint), "objectsServed", served, "detail", endpointErr.Error())
-			continue
-		}
-		switch {
-		case errors.Is(endpointErr, ErrDisabled):
-			// A repository with LFS switched off is an expected skip, and the
-			// endpoint that said so is the one serving the API.
-			if disabledErr == nil {
-				disabledErr = endpointErr
-			}
-		case errors.Is(endpointErr, ErrNoEndpoint):
-			// Nothing is mounted at this path; the next candidate may serve it.
-		case errors.Is(endpointErr, errBatchRejected):
-			if rejectedErr == nil {
-				rejectedErr = endpointErr
-			}
-		default:
-			// The candidate that failed may be the derived guess rather than the
-			// path the remote configures, so the remaining candidates still get
-			// their turn before this is reported.
-			if hardErr == nil {
-				hardErr = endpointErr
-			}
-		}
-		slog.Debug("No Git LFS service answered at this endpoint.", "endpoint", redactedURL(endpoint))
-	}
-
-	switch {
-	case hardErr != nil:
-		// A real failure on any candidate outranks another's "LFS is off"
-		// answer, which the mirror layer records as a successful skip: masking
-		// the failure would report an incomplete mirror as complete.
-		return hardErr
-	case disabledErr != nil:
-		// A candidate that answered "LFS is off" identified the API root, so its
-		// verdict is authoritative in a way another candidate's request-shape
-		// rejection is not.
-		return disabledErr
-	case rejectedErr != nil:
-		return rejectedErr
-	default:
-		// No candidate served the API, which the mirror layer records as LFS
-		// being switched off rather than failing the repository.
-		return ErrDisabled
-	}
+	// Nothing to fetch means the endpoint is never contacted, so a forge without
+	// LFS is not mistaken for one that disabled it.
+	return scan.pointers, nil
 }
 
 // batchObjectLimit is how many pointers one batch request submits. Git LFS
@@ -179,31 +166,21 @@ var ErrNoEndpoint = errors.New("no git lfs service answered at the endpoint")
 // endpoint or merely a chunk of stale pointers. Once a second chunk fails, the
 // fetch stops and reports rather than repeating the failure across a large
 // repository.
-//
-// The count of objects the endpoint served comes back with the error, because a
-// caller has to know whether an endpoint that now answers "no service" or "LFS
-// off" already mirrored part of the repository: a verdict that would mean a
-// clean skip cannot also mean a half-finished mirror.
 func (f *Fetcher) fetchBatches(
 	ctx context.Context,
 	store, endpoint, username, password string,
 	pointers []pointer,
-) (int, error) {
-	var unavailable, rejected, served int
-	var firstFailure, firstErr error
+) (chunkOutcome, error) {
+	var total chunkOutcome
+	var firstErr error
 	for start := 0; start < len(pointers); start += batchObjectLimit {
 		end := min(start+batchObjectLimit, len(pointers))
 		if err := ctx.Err(); err != nil {
-			return served, err
+			return total, err
 		}
 
 		outcome, err := f.fetchChunk(ctx, store, endpoint, username, password, pointers[start:end])
-		unavailable += outcome.unavailable
-		rejected += outcome.rejected
-		served += outcome.served
-		if outcome.skipped != nil && firstFailure == nil {
-			firstFailure = outcome.skipped
-		}
+		total.absorb(outcome)
 		if err == nil {
 			continue
 		}
@@ -220,33 +197,23 @@ func (f *Fetcher) fetchBatches(
 		firstErr = err
 	}
 
-	skipped := unavailable + rejected
-	if skipped > 0 {
-		// The mirrored repository stays usable, but its LFS content is not
-		// complete, so say so once per repository at warn level and keep the
-		// per-object reasons for debug output.
-		slog.Warn("Some Git LFS objects could not be fetched; the repository was mirrored without them.",
-			"endpoint", redactedURL(endpoint), "objectsMissing", skipped, "objectsRequested", len(pointers))
-		slog.Debug("Git LFS objects that could not be fetched.",
-			"endpoint", redactedURL(endpoint), "reason", firstFailure.Error())
-	}
 	if firstErr != nil {
-		return served, firstErr
+		return total, firstErr
 	}
-	if skipped > 0 {
-		return served, fmt.Errorf("%d of %d LFS objects could not be fetched: %w", skipped, len(pointers), firstFailure)
+	if missing := total.unavailable + total.rejected; missing > 0 {
+		return total, fmt.Errorf("%d of %d LFS objects could not be fetched: %w", missing, len(pointers), total.skipped)
 	}
-	return served, nil
+	return total, nil
 }
 
 // chunkOutcome reports what one batch request could not fetch — objects the
 // endpoint answered for but will not serve, and objects whose own batch request
-// the endpoint rejected outright — and how many it did serve. skipped, when
-// set, names the first object that could not be fetched.
+// the endpoint rejected outright — and whether it answered for any of them.
+// skipped, when set, names the first object that could not be fetched.
 type chunkOutcome struct {
 	unavailable int
 	rejected    int
-	served      int
+	served      bool
 	skipped     error
 }
 
@@ -336,7 +303,7 @@ func isRefusal(err error) bool {
 // errBatchRejected — which callers report and stop the sweep after, since only a
 // second such chunk tells stale pointers apart from a broken endpoint.
 func refuseOrReport(outcome chunkOutcome, rejection error) (chunkOutcome, error) {
-	if outcome.served > 0 || outcome.unavailable > 0 {
+	if outcome.served || outcome.unavailable > 0 {
 		return outcome, nil
 	}
 	return outcome, fmt.Errorf("%w: %w", errAllRejected, rejection)
@@ -345,20 +312,21 @@ func refuseOrReport(outcome chunkOutcome, rejection error) (chunkOutcome, error)
 // downloadChunk streams every object the batch scheduled. Objects the endpoint
 // will not serve are recorded and skipped so their siblings still download, and
 // so are objects this client could not transfer — attempted, but unreachable —
-// which come back as an error once every object has had its turn.
+// which come back as an error once every object has had its turn. A `served`
+// chunk is one whose bytes actually arrived here, which is what tells a rejection
+// that arrived beside real content from one that stands alone.
 func (f *Fetcher) downloadChunk(
 	ctx context.Context,
 	store, endpoint, username, password string,
 	objects []batchResponseObject,
 ) (chunkOutcome, error) {
-	unavailable, failed := downloadObjects(ctx, f.client, store, endpoint, username, password, objects)
+	cached, unavailable, failed := downloadObjects(ctx, f.client, store, endpoint, username, password, objects)
 
 	var outcome chunkOutcome
 	for _, object := range unavailable {
 		outcome.recordUnavailable(fmt.Errorf("%w: %s", errObjectUnavailable, object.Error()))
 	}
-	// Whatever the endpoint did not refuse, it answered for one way or another.
-	outcome.served = len(objects) - len(unavailable)
+	outcome.served = len(objects) > len(unavailable)+len(cached)
 	if len(failed) > 0 {
 		return outcome, fmt.Errorf("%d of %d LFS objects could not be downloaded: %w", len(failed), len(objects), failed[0])
 	}
@@ -378,145 +346,10 @@ func (o *chunkOutcome) recordUnavailable(reason error) {
 func (o *chunkOutcome) absorb(half chunkOutcome) {
 	o.unavailable += half.unavailable
 	o.rejected += half.rejected
-	o.served += half.served
+	o.served = o.served || half.served
 	if half.skipped != nil && o.skipped == nil {
 		o.skipped = half.skipped
 	}
-}
-
-// resolveEndpoints determines the LFS API roots to try, in order: an lfs.url
-// override from the repository's committed .lfsconfig when present, otherwise
-// the remote URL's standard /info/lfs root with and without the repository's
-// .git suffix.
-//
-// The batch request authenticates with the remote's credential, so an override
-// is honored only when it is an absolute http(s) URL on the remote's own host
-// and scheme — a hostile .lfsconfig must not redirect that credential elsewhere
-// or downgrade it to plaintext. Reading .lfsconfig is best-effort — any failure
-// falls back to the derived endpoints, matching the common deployment.
-func resolveEndpoints(repository *git.Repository, remoteURL string) ([]string, error) {
-	parsed, ok := paths.ParseHTTPURL(remoteURL)
-	if !ok {
-		return nil, fmt.Errorf("unsupported remote URL '%s': only http and https are allowed", redactedURL(remoteURL))
-	}
-
-	config, err := readLFSConfig(repository)
-	if err == nil && config != nil {
-		if override := strings.TrimSpace(config.Raw.Section("lfs").Option("url")); override != "" {
-			overridden, ok := paths.ParseHTTPURL(override)
-			if !ok {
-				return nil, fmt.Errorf("unsupported lfs.url '%s': only absolute http and https URLs are allowed", redactedURL(override))
-			}
-			if !strings.EqualFold(overridden.Scheme, parsed.Scheme) || canonicalHost(overridden) != canonicalHost(parsed) {
-				return nil, fmt.Errorf("refusing lfs.url '%s': the override must stay on the remote host and scheme so the remote credential is not sent elsewhere", redactedURL(override))
-			}
-			// Drop a redundant scheme-default port so the endpoint is canonical:
-			// object-download host comparisons and logs then match hrefs rendered
-			// without the explicit port.
-			if overridden.Port() != "" && isSchemeDefaultPort(overridden) {
-				overridden.Host = strings.TrimSuffix(overridden.Host, ":"+overridden.Port())
-			}
-			return []string{strings.TrimSuffix(overridden.String(), "/")}, nil
-		}
-	}
-	// A remote that already carries the repository suffix, or has no path at
-	// all, reaches the API at one path, so there is nothing to fall back to:
-	// probing the same URL twice would only repeat every request.
-	suffixed, plain := defaultEndpoint(parsed), plainEndpoint(parsed)
-	if suffixed == plain {
-		return []string{suffixed}, nil
-	}
-	return []string{suffixed, plain}, nil
-}
-
-// defaultEndpoint derives the remote's standard LFS API root, including the
-// repository's .git suffix.
-//
-// Git LFS clients request "<remote>[/info/lfs]" with the suffix their remote
-// uses, and forges route only the suffixed path to their LFS service: GitHub
-// and GitLab answer a suffix-less /info/lfs with 422, while Forgejo and Gitea
-// accept either form. The mirror's remote has no .git suffix because a config
-// URL rarely carries one, so the suffix is added here whenever it is absent;
-// plainEndpoint is the fallback for a service that routes the suffix-less path.
-//
-// The parsed URL is copied and only its path rewritten, from its escaped form so
-// percent-encoding survives: a remote whose path holds a reserved byte — an
-// encoded slash in a repository name, say — must keep requesting that exact
-// path. Everything else the configured remote carries, userinfo for a deployment
-// that embeds credentials and a non-default port among it, still reaches the
-// endpoint. A remote with no path has no repository to suffix, but the API root
-// is still /info/lfs on that host.
-func defaultEndpoint(remoteURL *url.URL) string {
-	endpoint := endpointBase(remoteURL)
-
-	escaped := strings.TrimSuffix(remoteURL.EscapedPath(), "/")
-	if escaped == "" {
-		// No repository segment to suffix, but the API root is still /info/lfs
-		// on that host.
-		return withPath(endpoint, "/info/lfs")
-	}
-	// The suffix is judged on the decoded path but appended to the escaped one,
-	// so a remote whose escaping hides it (re%2Egit) is not given a second
-	// suffix it did not need. It is matched case-insensitively, as the mirror's
-	// other .git handling does: a remote already ending in ".GIT" must not gain
-	// a differently cased one that no forge serves.
-	if !hasGitSuffix(strings.TrimSuffix(remoteURL.Path, "/")) {
-		escaped += ".git"
-	}
-	return withPath(endpoint, escaped+"/info/lfs")
-}
-
-// plainEndpoint derives the LFS API root at the remote's configured path,
-// without adding the repository suffix: the fallback for a service that routes
-// /info/lfs exactly where the remote points.
-func plainEndpoint(remoteURL *url.URL) string {
-	endpoint := endpointBase(remoteURL)
-	return withPath(endpoint, strings.TrimSuffix(remoteURL.EscapedPath(), "/")+"/info/lfs")
-}
-
-// endpointBase copies a remote URL with the parts an API root cannot carry
-// removed: a query, a forced empty query, and a fragment would otherwise sit
-// between the endpoint and the action path appended to it.
-func endpointBase(remoteURL *url.URL) url.URL {
-	endpoint := *remoteURL
-	endpoint.RawQuery = ""
-	endpoint.ForceQuery = false
-	endpoint.Fragment = ""
-	endpoint.RawFragment = ""
-	return endpoint
-}
-
-// withPath points an endpoint at an escaped path, keeping Path decoded so
-// String() does not escape the escaping a second time.
-func withPath(endpoint url.URL, escaped string) string {
-	endpoint.RawPath = escaped
-	endpoint.Path, _ = url.PathUnescape(escaped)
-	return endpoint.String()
-}
-
-// hasGitSuffix reports whether a remote path already ends in the repository
-// suffix, in any case.
-func hasGitSuffix(path string) bool {
-	return len(path) >= len(".git") && strings.EqualFold(path[len(path)-len(".git"):], ".git")
-}
-
-// isSchemeDefaultPort reports whether the URL's explicit port equals its
-// scheme's default (http 80, https 443).
-func isSchemeDefaultPort(u *url.URL) bool {
-	return (strings.EqualFold(u.Scheme, "http") && u.Port() == "80") ||
-		(strings.EqualFold(u.Scheme, "https") && u.Port() == "443")
-}
-
-// canonicalHost renders the URL's host lowercased with any scheme-default
-// port removed, so an explicit https://host:443 compares equal to
-// https://host while a redirect to any other port stays distinct.
-func canonicalHost(u *url.URL) string {
-	host := strings.ToLower(u.Hostname())
-	port := u.Port()
-	if port == "" || isSchemeDefaultPort(u) {
-		return host
-	}
-	return host + ":" + port
 }
 
 // redactedURL renders a URL with any embedded password masked, for safe
