@@ -1424,7 +1424,7 @@ func TestEndpointCandidatesCollapseDuplicates(t *testing.T) {
 				t.Fatalf("resolveEndpoints failed: %v", err)
 			}
 			if len(endpoints) != 1 {
-				t.Errorf("endpoints = %q, want one candidate for a remote that has only one path", redactedURL(strings.Join(endpoints, ",")))
+				t.Errorf("endpoints = %q, want one candidate for a remote that has only one path", redactedURL(strings.Join(candidateURLs(endpoints), ",")))
 			}
 		})
 	}
@@ -1490,19 +1490,28 @@ func TestEndpointCandidatesOverrideHostAndScheme(t *testing.T) {
 			endpoints, err := endpointCandidates(repository, parsed)
 			if c.wantReject {
 				if err == nil {
-					t.Fatalf("resolveEndpoints = %q, want rejection", redactedURL(strings.Join(endpoints, ",")))
+					t.Fatalf("resolveEndpoints = %q, want rejection", redactedURL(strings.Join(candidateURLs(endpoints), ",")))
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("resolveEndpoints failed: %v", err)
 			}
-			if len(endpoints) != 1 || endpoints[0] != c.wantAddress {
-				t.Errorf("endpoints = %q, want just %q", redactedURL(strings.Join(endpoints, ",")), redactedURL(c.wantAddress))
+			if len(endpoints) != 1 || endpoints[0].url != c.wantAddress {
+				t.Errorf("endpoints = %q, want just %q", redactedURL(strings.Join(candidateURLs(endpoints), ",")), redactedURL(c.wantAddress))
 			}
 			if lfsServer.batchCallCount() != 0 {
 				t.Error("resolveEndpoints must not contact any endpoint")
 			}
 		})
 	}
+}
+
+// candidateURLs renders candidates for a test message.
+func candidateURLs(candidates []endpointCandidate) []string {
+	urls := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		urls = append(urls, candidate.url)
+	}
+	return urls
 }

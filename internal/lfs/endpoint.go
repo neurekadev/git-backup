@@ -28,7 +28,38 @@ import (
 // and scheme: a hostile .lfsconfig must not redirect that credential elsewhere
 // or downgrade it to plaintext. Reading .lfsconfig is best-effort — any failure
 // falls back to the derived candidates, matching the common deployment.
-func endpointCandidates(repository *git.Repository, parsed *url.URL) ([]string, error) {
+// endpointCandidate is one API root worth asking, and whether this package
+// derived it rather than taking it from the configured remote.
+//
+// The distinction decides how much an answer weighs. A path the remote actually
+// points at is the repository's own root, so its verdict speaks for the
+// repository; a derived path is a guess about how the host routes LFS, and a
+// guess answering "LFS is off" is weaker evidence than a real failure on the
+// path the remote configures.
+type endpointCandidate struct {
+	url string
+	// derived marks the suffixed root this package adds when the configured
+	// remote does not carry one.
+	derived bool
+}
+
+// endpointCandidates lists, in the order they should be asked, the API roots a
+// repository's LFS objects may live under: an lfs.url override from the
+// repository's committed .lfsconfig when present, otherwise the remote URL's
+// standard /info/lfs root with and without the repository's .git suffix.
+//
+// Which of the derived roots answers is a property of the host, and no rule
+// decides it: GitHub and GitLab route only the suffixed path to their LFS
+// service and answer a suffix-less /info/lfs with 422, while a host may mount
+// the service exactly where its remote points. The distinction is therefore
+// settled by asking, once, before any object is fetched — see selectEndpoint.
+//
+// The batch request authenticates with the remote's credential, so an override
+// is honored only when it is an absolute http(s) URL on the remote's own host
+// and scheme: a hostile .lfsconfig must not redirect that credential elsewhere
+// or downgrade it to plaintext. Reading .lfsconfig is best-effort — any failure
+// falls back to the derived candidates, matching the common deployment.
+func endpointCandidates(repository *git.Repository, parsed *url.URL) ([]endpointCandidate, error) {
 	config, err := readLFSConfig(repository)
 	if err == nil && config != nil {
 		if override := strings.TrimSpace(config.Raw.Section("lfs").Option("url")); override != "" {
@@ -49,7 +80,7 @@ func endpointCandidates(repository *git.Repository, parsed *url.URL) ([]string, 
 			// along: the action path is appended to the endpoint, so anything
 			// after the path would land in the middle of the request line.
 			cleaned := endpointBase(overridden)
-			return []string{strings.TrimSuffix(cleaned.String(), "/")}, nil
+			return []endpointCandidate{{url: strings.TrimSuffix(cleaned.String(), "/")}}, nil
 		}
 	}
 
@@ -57,60 +88,70 @@ func endpointCandidates(repository *git.Repository, parsed *url.URL) ([]string, 
 	// all, reaches the API at one path, so there is nothing to choose between.
 	suffixed, plain := suffixedEndpoint(parsed), plainEndpoint(parsed)
 	if suffixed == plain {
-		return []string{suffixed}, nil
+		return []endpointCandidate{{url: suffixed}}, nil
 	}
-	return []string{suffixed, plain}, nil
+	// The configured remote's own path is asked second only because a forge that
+	// requires the suffix is the more common deployment; it is not the weaker
+	// candidate.
+	return []endpointCandidate{{url: suffixed, derived: true}, {url: plain}}, nil
 }
 
 // selectEndpoint answers which candidate serves this repository's LFS API, by
 // asking each one for a single object before anything is downloaded.
 //
-// Asking first is what keeps the fetch itself simple. A probe separates the
+// Asking first is what keeps the fetch itself simple: a probe separates the
 // answers a host can give — the API answered for the object, LFS is switched
 // off, nothing is mounted at that path, or the endpoint failed — so the fetch
 // then runs against one known-good endpoint with no fallback to reconcile.
 //
-// Every candidate is asked, because each answer can be about the path rather
-// than the repository: a 403 with an HTML body and a failure both leave the next
-// candidate worth trying. What settles the repository is the strongest answer
-// collected: a failure outranks "LFS is off", which would otherwise be recorded
-// as a successful skip and hide an incomplete mirror.
+// Every candidate is asked, and what decides the repository is the strongest
+// answer collected. A failure on a path the remote actually configures outranks
+// a disabled verdict from a derived guess, because a failure describes the
+// endpoint itself and the mirror layer records disabled as a successful skip:
+// preferring the guess's verdict would mirror the repository with no LFS content
+// and raise nothing. A disabled verdict from the configured path is the
+// repository's own answer, so it wins instead — a guess that is merely wrong for
+// the host must not turn a repository with nothing to mirror into a failure.
 func (f *Fetcher) selectEndpoint(
 	ctx context.Context,
-	candidates []string,
+	candidates []endpointCandidate,
 	username, password string,
 	first pointer,
 ) (string, error) {
-	var disabled, failed error
+	var disabled, disabledFromConfigured, failed, configuredFailed error
 	for _, candidate := range candidates {
-		switch err := f.client.probe(ctx, candidate, username, password, first); {
+		switch err := f.client.probe(ctx, candidate.url, username, password, first); {
 		case err == nil:
-			slog.Debug("Git LFS API answered.", "endpoint", redactedURL(candidate))
-			return candidate, nil
+			slog.Debug("Git LFS API answered.", "endpoint", redactedURL(candidate.url))
+			return candidate.url, nil
 		case errors.Is(err, ErrDisabled):
-			slog.Debug("Git LFS is switched off for this repository.", "endpoint", redactedURL(candidate))
+			slog.Debug("Git LFS is switched off for this repository.", "endpoint", redactedURL(candidate.url))
 			if disabled == nil {
 				disabled = err
 			}
+			if !candidate.derived && disabledFromConfigured == nil {
+				disabledFromConfigured = err
+			}
 		case errors.Is(err, ErrNoEndpoint):
-			slog.Debug("No Git LFS API is mounted at this endpoint.", "endpoint", redactedURL(candidate))
+			slog.Debug("No Git LFS API is mounted at this endpoint.", "endpoint", redactedURL(candidate.url))
 		default:
 			// The endpoint and the error both describe URLs, and the error's own
 			// text repeats the one the request went to, so it is redacted too
 			// before it reaches the log.
 			slog.Debug("Git LFS API did not answer.",
-				"endpoint", redactedURL(candidate), "detail", redactedURL(err.Error()))
+				"endpoint", redactedURL(candidate.url), "detail", redactedURL(err.Error()))
 			if failed == nil {
 				failed = err
 			}
+			if !candidate.derived && configuredFailed == nil {
+				configuredFailed = err
+			}
 		}
 	}
-	switch {
-	case disabled != nil:
-		// A service that answered "LFS is off for this repository" identified
-		// the API root, and the mirror layer records that as an expected skip. A
-		// guess that is simply wrong for the host answering differently must not
-		// turn a repository with no LFS content to mirror into a failed backup.
+
+	// A disabled verdict only decides when nothing failed on the path the remote
+	// configures, or when the configured path is the one that reported it.
+	if disabledFromConfigured != nil || (disabled != nil && configuredFailed == nil) {
 		if failed != nil {
 			// The failure still happened, so it is kept for the debug trail
 			// rather than discarded — it is just not what decides the fetch.
@@ -118,14 +159,14 @@ func (f *Fetcher) selectEndpoint(
 				"detail", redactedURL(failed.Error()))
 		}
 		return "", disabled
-	case failed != nil:
-		return "", failed
-	default:
-		// No candidate serves the API. The mirror layer records that as LFS
-		// being switched off rather than failing the repository, which is the
-		// closest truthful reading available from a client.
-		return "", ErrDisabled
 	}
+	if failed != nil {
+		return "", failed
+	}
+	// No candidate serves the API. The mirror layer records that as LFS being
+	// switched off rather than failing the repository, which is the closest
+	// truthful reading available from a client.
+	return "", ErrDisabled
 }
 
 // suffixedEndpoint derives the remote's standard LFS API root, including the
