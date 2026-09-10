@@ -257,16 +257,17 @@ func looksLikeHTML(body []byte) bool {
 //
 // Every object is attempted whatever the others did, so one bad pointer or one
 // transient transfer failure cannot hide its siblings. What failed comes back in
-// the three lists: cached for objects already in the cache, unavailable for
-// objects the endpoint will not serve, and failed for objects this client could
-// not transfer — a corrupt body, a broken connection — which the caller reports
-// rather than recording as the endpoint's refusal.
+// two lists: unavailable for objects the endpoint will not serve, and failed for
+// objects this client could not transfer — a corrupt body, a broken connection —
+// which the caller reports rather than recording as the endpoint's refusal. Both
+// lists are about objects the endpoint did not answer for with content; what it
+// answered for is what the caller counts as evidence that it processed the chunk.
 func downloadObjects(
 	ctx context.Context,
 	client *batchClient,
 	store, endpoint, username, password string,
 	objects []batchResponseObject,
-) (cached, unavailable []*batchObjectError, failed []error) {
+) (unavailable []*batchObjectError, failed []error) {
 	endpointHost := hostOf(endpoint)
 	answered := func(object batchResponseObject) *batchObjectError {
 		switch {
@@ -283,23 +284,17 @@ func downloadObjects(
 
 	for _, object := range objects {
 		if err := ctx.Err(); err != nil {
-			return cached, unavailable, append(failed, err)
+			return unavailable, append(failed, err)
 		}
 		if refused := answered(object); refused != nil {
 			unavailable = append(unavailable, refused)
 			continue
 		}
-		stored, err := downloadObject(ctx, client.client, store, endpointHost, username, password, object.OID, object.Actions["download"])
-		switch {
-		case err != nil:
+		if _, err := downloadObject(ctx, client.client, store, endpointHost, username, password, object.OID, object.Actions["download"]); err != nil {
 			failed = append(failed, err)
-		case stored:
-			// Already in the cache: the endpoint answered for it, but this
-			// request never streamed it.
-			cached = append(cached, &batchObjectError{oid: object.OID, message: "already in the local cache"})
 		}
 	}
-	return cached, unavailable, failed
+	return unavailable, failed
 }
 
 // downloadObject streams one object into the LFS cache, verifying its SHA-256 as

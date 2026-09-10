@@ -208,12 +208,13 @@ func (f *Fetcher) fetchBatches(
 
 // chunkOutcome reports what one batch request could not fetch — objects the
 // endpoint answered for but will not serve, and objects whose own batch request
-// the endpoint rejected outright — and whether it answered for any of them.
+// the endpoint rejected outright — and whether it answered for any of them, which
+// is what separates a rejection beside real answers from one that stands alone.
 // skipped, when set, names the first object that could not be fetched.
 type chunkOutcome struct {
 	unavailable int
 	rejected    int
-	served      bool
+	answered    bool
 	skipped     error
 }
 
@@ -307,7 +308,7 @@ func isRefusal(err error) bool {
 // errBatchRejected — which callers report and stop the sweep after, since only a
 // second such chunk tells stale pointers apart from a broken endpoint.
 func refuseOrReport(outcome chunkOutcome, rejection error) (chunkOutcome, error) {
-	if outcome.served || outcome.unavailable > 0 {
+	if outcome.answered || outcome.unavailable > 0 {
 		return outcome, nil
 	}
 	return outcome, fmt.Errorf("%w: %w", errAllRejected, rejection)
@@ -316,25 +317,26 @@ func refuseOrReport(outcome chunkOutcome, rejection error) (chunkOutcome, error)
 // downloadChunk streams every object the batch scheduled. Objects the endpoint
 // will not serve are recorded and skipped so their siblings still download, and
 // so are objects this client could not transfer — attempted, but unreachable —
-// which come back as an error once every object has had its turn. A `served`
-// chunk is one whose bytes actually arrived here, which is what tells a rejection
-// that arrived beside real content from one that stands alone.
+// which come back as an error once every object has had its turn. The chunk
+// counts as answered when the endpoint replied with content for any scheduled
+// object, which is what tells a rejection beside real answers from one that
+// stands alone.
 func (f *Fetcher) downloadChunk(
 	ctx context.Context,
 	store, endpoint, username, password string,
 	objects []batchResponseObject,
 ) (chunkOutcome, error) {
-	cached, unavailable, failed := downloadObjects(ctx, f.client, store, endpoint, username, password, objects)
+	unavailable, failed := downloadObjects(ctx, f.client, store, endpoint, username, password, objects)
 
 	var outcome chunkOutcome
 	for _, object := range unavailable {
 		outcome.recordUnavailable(fmt.Errorf("%w: %s", errObjectUnavailable, object.Error()))
 	}
-	// The endpoint answering for an object is the evidence that it processed
-	// this chunk, and it answered for these either way: streamed now, or already
-	// in the store. A chunk it answered for is not a chunk it refused, so a
-	// rejection beside them is one object's fault rather than the endpoint's.
-	outcome.served = len(objects) > len(unavailable)+len(cached)
+	// The endpoint answered for every object that is not unavailable, whether it
+	// streamed the bytes now or found them already in the store. A chunk it
+	// answered for is not a chunk it refused, so a rejection beside those answers
+	// is one object's fault rather than the endpoint's.
+	outcome.answered = len(objects) > len(unavailable)
 	if len(failed) > 0 {
 		return outcome, fmt.Errorf("%d of %d LFS objects could not be downloaded: %w", len(failed), len(objects), failed[0])
 	}
@@ -354,7 +356,7 @@ func (o *chunkOutcome) recordUnavailable(reason error) {
 func (o *chunkOutcome) absorb(half chunkOutcome) {
 	o.unavailable += half.unavailable
 	o.rejected += half.rejected
-	o.served = o.served || half.served
+	o.answered = o.answered || half.answered
 	if half.skipped != nil && o.skipped == nil {
 		o.skipped = half.skipped
 	}
