@@ -135,16 +135,34 @@ func (c *batchClient) probe(ctx context.Context, endpoint, username, password st
 		// reporting that the server does not have it.
 		return nil
 	case http.StatusForbidden:
-		// The forge has LFS switched off for this repository.
-		return ErrDisabled
-	case http.StatusNotFound, http.StatusUnprocessableEntity:
+		// Two different things answer 403: a forge saying LFS is switched off
+		// for this repository, and a host page refusing a path it does not
+		// serve. The LFS API explains itself — in JSON, and sometimes with no
+		// body at all, which is still a verdict about the repository — while an
+		// edge page does not.
+		return classifyRefusal(response, ErrDisabled)
+	case http.StatusNotFound:
 		// Nothing is mounted at this path: a host that routes by path answers
-		// 404, and one that validates the action answers a single-object
-		// request with 422.
+		// 404.
 		return ErrNoEndpoint
 	default:
-		return fmt.Errorf("batch request failed with status %d", response.StatusCode)
+		// Unprocessable is how an edge refuses a path it does not serve as much
+		// as it is how the API refuses a request's shape, so the body separates
+		// them; every other status describes the endpoint and is reported rather
+		// than read as a wrong path.
+		return classifyRefusal(response, fmt.Errorf("batch request failed with status %d", response.StatusCode))
 	}
+}
+
+// classifyRefusal reads a refusal the API did not phrase as a verdict about one
+// object. Markup means a host page answered — the path is not the API — and
+// anything else is the API speaking, which the caller reads as verdict.
+func classifyRefusal(response *http.Response, verdict error) error {
+	body, err := io.ReadAll(io.LimitReader(response.Body, 4096))
+	if err == nil && looksLikeHTML(body) {
+		return ErrNoEndpoint
+	}
+	return verdict
 }
 
 // batch submits every pointer for download scheduling.
@@ -215,6 +233,15 @@ func describesRequestShape(status int) bool {
 	default:
 		return false
 	}
+}
+
+// looksLikeHTML reports whether a body is a markup document, which is what an
+// edge or proxy answers with and what the LFS API never does. A JSON document or
+// an empty body is therefore read as the API speaking; markup is read as the path
+// being refused by something that is not the API.
+func looksLikeHTML(body []byte) bool {
+	trimmed := bytes.TrimSpace(bytes.ToLower(body))
+	return bytes.HasPrefix(trimmed, []byte("<!doctype")) || bytes.HasPrefix(trimmed, []byte("<html"))
 }
 
 // downloadObjects streams each scheduled object into the repository's LFS

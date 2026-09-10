@@ -123,6 +123,15 @@ func newFakeLFSServer(t *testing.T, data map[string][]byte) *fakeLFSServer {
 	return s
 }
 
+// writeUnmounted answers the way a forge's edge does for a repository path it
+// does not route to an LFS API: a page, which is what tells a client the path is
+// wrong rather than the repository LFS-free.
+func writeUnmounted(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusUnprocessableEntity)
+	_, _ = w.Write([]byte("<!DOCTYPE html>\n<html><head><title>Oh no</title></head><body>unexpected</body></html>"))
+}
+
 // remoteURL is the remote a repository would use to reach the fake server.
 func (s *fakeLFSServer) remoteURL() string {
 	return s.server.URL + "/repo.git"
@@ -186,22 +195,24 @@ func (s *fakeLFSServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 	hasServePaths := len(s.servePaths) > 0
 	s.mu.Unlock()
 
-	// A path the server does not serve answers 404, the response that tells a
-	// client no LFS service is mounted there.
+	// A path the server does not serve answers the way the forges this package
+	// was written against do: a host page for the path it will not route, and
+	// markup rather than an LFS explanation. The disabled verdict is decided
+	// first, because a repository with LFS off answers 403 for its own path even
+	// when the test also mounts the service elsewhere.
 	if batchPath != "" && r.URL.Path != batchPath {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	if hasServePaths && !servedHere {
-		w.WriteHeader(http.StatusNotFound)
+		writeUnmounted(w)
 		return
 	}
 	if disabled {
-		// A forge with LFS switched off explains itself in JSON; a host with no
-		// service behind the path answers with its own HTML page.
+		// A forge with LFS switched off explains itself in JSON.
 		w.Header().Set("Content-Type", lfsMediaType)
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`{"message":"Git LFS is disabled for this repository."}`))
+		return
+	}
+	if hasServePaths && !servedHere {
+		writeUnmounted(w)
 		return
 	}
 

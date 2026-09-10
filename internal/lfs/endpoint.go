@@ -45,7 +45,11 @@ func endpointCandidates(repository *git.Repository, parsed *url.URL) ([]string, 
 			if overridden.Port() != "" && isSchemeDefaultPort(overridden) {
 				overridden.Host = strings.TrimSuffix(overridden.Host, ":"+overridden.Port())
 			}
-			return []string{strings.TrimSuffix(overridden.String(), "/")}, nil
+			// An override's own query, forced query, and fragment cannot ride
+			// along: the action path is appended to the endpoint, so anything
+			// after the path would land in the middle of the request line.
+			cleaned := endpointBase(overridden)
+			return []string{strings.TrimSuffix(cleaned.String(), "/")}, nil
 		}
 	}
 
@@ -63,44 +67,54 @@ func endpointCandidates(repository *git.Repository, parsed *url.URL) ([]string, 
 //
 // Asking first is what keeps the fetch itself simple. A probe separates the
 // answers a host can give — the API answered for the object, LFS is switched
-// off, or nothing is mounted at that path — so the fetch then runs against one
-// known-good endpoint with no fallback to reconcile, and no working endpoint can
-// be mistaken for a missing one halfway through a repository.
+// off, nothing is mounted at that path, or the endpoint failed — so the fetch
+// then runs against one known-good endpoint with no fallback to reconcile.
+//
+// Every candidate is asked, because each answer can be about the path rather
+// than the repository: a 403 with an HTML body and a failure both leave the next
+// candidate worth trying. What settles the repository is the strongest answer
+// collected: a failure outranks "LFS is off", which would otherwise be recorded
+// as a successful skip and hide an incomplete mirror.
 func (f *Fetcher) selectEndpoint(
 	ctx context.Context,
 	candidates []string,
 	username, password string,
 	first pointer,
 ) (string, error) {
-	var hardErr error
+	var disabled, failed error
 	for _, candidate := range candidates {
 		switch err := f.client.probe(ctx, candidate, username, password, first); {
 		case err == nil:
 			slog.Debug("Git LFS API answered.", "endpoint", redactedURL(candidate))
 			return candidate, nil
 		case errors.Is(err, ErrDisabled):
-			// The service answered that LFS is off for this repository, which no
-			// other candidate can outrank: a different path is not a different
-			// repository.
-			return "", err
+			slog.Debug("Git LFS is switched off for this repository.", "endpoint", redactedURL(candidate))
+			if disabled == nil {
+				disabled = err
+			}
 		case errors.Is(err, ErrNoEndpoint):
 			slog.Debug("No Git LFS API is mounted at this endpoint.", "endpoint", redactedURL(candidate))
 		default:
-			// The candidate that failed may be the derived guess rather than the
-			// path the remote configures, so the remaining candidates still get
-			// their turn before this is reported.
-			if hardErr == nil {
-				hardErr = err
+			slog.Debug("Git LFS API did not answer.", "endpoint", redactedURL(candidate), "detail", err.Error())
+			if failed == nil {
+				failed = err
 			}
 		}
 	}
-	if hardErr != nil {
-		return "", hardErr
+	switch {
+	case failed != nil:
+		// A candidate that failed describes something wrong beyond a missing
+		// path, so it outranks a disabled verdict another candidate gave: the
+		// failure is reported rather than recorded as a successful skip.
+		return "", failed
+	case disabled != nil:
+		return "", disabled
+	default:
+		// No candidate serves the API. The mirror layer records that as LFS
+		// being switched off rather than failing the repository, which is the
+		// closest truthful reading available from a client.
+		return "", ErrDisabled
 	}
-	// No candidate serves the API. The mirror layer records that as LFS being
-	// switched off rather than failing the repository, which is the closest
-	// truthful reading available from a client.
-	return "", ErrDisabled
 }
 
 // suffixedEndpoint derives the remote's standard LFS API root, including the

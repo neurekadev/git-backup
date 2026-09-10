@@ -250,16 +250,16 @@ func (f *Fetcher) fetchChunk(
 	rejection := err
 
 	// A rejected chunk wider than one pointer is retried as two batches, and
-	// each half narrows further on its own. The sibling half is always tried,
-	// whatever the first half concluded: a half in which the endpoint answered
-	// nothing may consist of individually refused objects rather than a refused
-	// endpoint, and only the sibling's answer — or its absence — settles which.
-	// Trying it is also what lets the sibling's objects reach the mirror when
-	// only the first half is poisoned.
+	// each half narrows further on its own. Both halves are always tried, so a
+	// failure in one cannot cost the other its objects, and the pair is what
+	// makes the chunk's outcome complete whichever half went wrong.
 	if len(pointers) > 1 {
 		middle := len(pointers) / 2
 		outcome, firstErr := f.fetchChunk(ctx, store, endpoint, username, password, pointers[:middle])
 		if firstErr != nil && !isRefusal(firstErr) {
+			// A half that failed outright still must not cost its sibling.
+			rest, _ := f.fetchChunk(ctx, store, endpoint, username, password, pointers[middle:])
+			outcome.absorb(rest)
 			return outcome, firstErr
 		}
 
@@ -280,11 +280,15 @@ func (f *Fetcher) fetchChunk(
 	// can be blamed. Whether that is this object's fault or the endpoint's is
 	// decided one level up, by whether the sibling half was served; this subtree
 	// has served nothing either way.
+	//
+	// The object's own report renders the rejection rather than wrapping it: an
+	// error matching both sentinels would read as the endpoint's refusal and as
+	// one object's unavailability at once, and callers weigh those differently.
 	slog.Debug("Git LFS batch request rejected for a single object.",
 		"endpoint", redactedURL(endpoint), "oid", shortOID(pointers[0].oid), "reason", rejection.Error())
 	return chunkOutcome{
 		rejected: 1,
-		skipped: fmt.Errorf("%w: LFS object %s download request rejected: %w",
+		skipped: fmt.Errorf("%w: LFS object %s download request rejected: %v",
 			errObjectUnavailable, shortOID(pointers[0].oid), rejection),
 	}, fmt.Errorf("%w: %w", errNarrowedToSingleton, rejection)
 }
@@ -326,7 +330,12 @@ func (f *Fetcher) downloadChunk(
 	for _, object := range unavailable {
 		outcome.recordUnavailable(fmt.Errorf("%w: %s", errObjectUnavailable, object.Error()))
 	}
-	outcome.served = len(objects) > len(unavailable)+len(cached)
+	// An object the endpoint answered for — streamed now or already in the store,
+	// which is what cached counts — is positive evidence that it processed this
+	// chunk, so a rejection beside one is that object's fault rather than the
+	// endpoint's.
+	outcome.served = len(objects) > len(unavailable)
+	_ = cached
 	if len(failed) > 0 {
 		return outcome, fmt.Errorf("%d of %d LFS objects could not be downloaded: %w", len(failed), len(objects), failed[0])
 	}
