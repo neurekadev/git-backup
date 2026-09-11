@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
@@ -17,6 +18,21 @@ import (
 type pointer struct {
 	oid  string // sha256 hex, lowercase
 	size int64
+}
+
+// skippedSubtree records a subtree the scan could not read, so its pointers are
+// known to be missing from the result rather than silently absent.
+type skippedSubtree struct {
+	name string
+	hash plumbing.Hash
+	err  error
+}
+
+// scanResult is what one scan of a repository found: the pointers it collected
+// and the subtrees it could not read.
+type scanResult struct {
+	pointers []pointer
+	skipped  []skippedSubtree
 }
 
 // pointerVersionValue is the version scheme URI on the first line of every
@@ -31,12 +47,13 @@ const pointerMaxBytes = 4 * 1024
 // inspected once. Commit history is traversed explicitly (rather than per-ref
 // iterators) so a repository with many refs costs one pass over its history,
 // not one per ref.
-func collectPointers(ctx context.Context, repository *git.Repository) ([]pointer, error) {
+func collectPointers(ctx context.Context, repository *git.Repository) (scanResult, error) {
 	seenCommits := make(map[plumbing.Hash]struct{})
 	seenTrees := make(map[plumbing.Hash]bool)
 	seenBlobs := make(map[plumbing.Hash]struct{})
 
 	var pointers []pointer
+	var skipped []skippedSubtree
 	seenPointers := make(map[string]struct{})
 
 	enqueue := func(queue []plumbing.Hash, hash plumbing.Hash) []plumbing.Hash {
@@ -52,7 +69,7 @@ func collectPointers(ctx context.Context, repository *git.Repository) ([]pointer
 	queue := make([]plumbing.Hash, 0, 64)
 	refs, err := repository.References()
 	if err != nil {
-		return nil, err
+		return scanResult{}, err
 	}
 	err = refs.ForEach(func(ref *plumbing.Reference) error {
 		if ref.Type() == plumbing.SymbolicReference || ref.Name().IsRemote() {
@@ -62,12 +79,12 @@ func collectPointers(ctx context.Context, repository *git.Repository) ([]pointer
 		return ctx.Err()
 	})
 	if err != nil {
-		return nil, err
+		return scanResult{}, err
 	}
 
 	for len(queue) > 0 {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return scanResult{}, err
 		}
 
 		hash := queue[len(queue)-1]
@@ -85,8 +102,8 @@ func collectPointers(ctx context.Context, repository *git.Repository) ([]pointer
 			continue
 		}
 
-		if err := scanTree(repository, commit.TreeHash, seenTrees, seenBlobs, seenPointers, &pointers); err != nil {
-			return nil, err
+		if err := scanTree(repository, commit.TreeHash, seenTrees, seenBlobs, seenPointers, &skipped, &pointers); err != nil {
+			return scanResult{}, err
 		}
 
 		for _, parent := range commit.ParentHashes {
@@ -94,7 +111,7 @@ func collectPointers(ctx context.Context, repository *git.Repository) ([]pointer
 		}
 	}
 
-	return pointers, nil
+	return scanResult{pointers: pointers, skipped: skipped}, nil
 }
 
 // peelToCommitHash resolves a ref tip hash to the commit it designates,
@@ -119,11 +136,24 @@ func peelToCommitHash(repository *git.Repository, hash plumbing.Hash) plumbing.H
 	}
 }
 
+// scanTree collects pointers from every blob under treeHash, descending into
+// subtrees iteratively.
+//
+// Subtrees are walked from their tree objects directly rather than through
+// object.TreeWalker: that walker validates each entry against the rules for
+// materialising a working tree, so a repository containing a path that is
+// illegal on the host — a backslash in an entry name on Windows, for instance —
+// would abort the whole backup even though the mirror clones and uploads
+// perfectly well. A tree object only ever holds entry names and subtree hashes,
+// so enumerating them needs no path handling at all. seenTrees bounds the walk
+// for repositories whose history repeats or self-references a tree, and makes
+// the cross-ref scan visit each tree once (see collectPointers).
 func scanTree(
 	repository *git.Repository,
 	treeHash plumbing.Hash,
 	seenTrees map[plumbing.Hash]bool, seenBlobs map[plumbing.Hash]struct{},
 	seenPointers map[string]struct{},
+	skipped *[]skippedSubtree,
 	pointers *[]pointer,
 ) error {
 	tree, err := repository.TreeObject(treeHash)
@@ -131,52 +161,72 @@ func scanTree(
 		return fmt.Errorf("read tree: %w", err)
 	}
 
-	walker := object.NewTreeWalker(tree, true, seenTrees)
-	defer walker.Close()
+	pending := []*object.Tree{tree}
+	seenTrees[treeHash] = true
 
-	for {
-		name, entry, err := walker.Next()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("walk tree: %w", err)
-		}
-		_ = name
+	for len(pending) > 0 {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
 
-		if !entry.Mode.IsFile() {
-			continue
-		}
-		if _, seen := seenBlobs[entry.Hash]; seen {
-			continue
-		}
-		seenBlobs[entry.Hash] = struct{}{}
+		for _, entry := range current.Entries {
+			if entry.Mode == filemode.Dir {
+				if seenTrees[entry.Hash] {
+					continue
+				}
+				seenTrees[entry.Hash] = true
 
-		blob, err := repository.BlobObject(entry.Hash)
-		if err != nil {
-			continue
-		}
-		if blob.Size > pointerMaxBytes {
-			continue
-		}
+				subtree, err := repository.TreeObject(entry.Hash)
+				if err != nil {
+					// A subtree missing from a partial fetch costs its
+					// pointers but leaves the rest of the scan intact; record
+					// it so the loss is reported rather than silent.
+					*skipped = append(*skipped, skippedSubtree{name: entry.Name, hash: entry.Hash, err: err})
+					continue
+				}
+				pending = append(pending, subtree)
+				continue
+			}
+			if !entry.Mode.IsFile() {
+				continue
+			}
+			if _, seen := seenBlobs[entry.Hash]; seen {
+				continue
+			}
+			seenBlobs[entry.Hash] = struct{}{}
 
-		reader, err := blob.Reader()
-		if err != nil {
-			continue
-		}
-		content, err := io.ReadAll(io.LimitReader(reader, pointerMaxBytes))
-		_ = reader.Close()
-		if err != nil {
-			continue
-		}
+			blob, err := repository.BlobObject(entry.Hash)
+			if err != nil {
+				// A blob missing from a partial fetch costs whatever pointer it
+				// held; record it so the loss is reported rather than silent.
+				*skipped = append(*skipped, skippedSubtree{name: entry.Name, hash: entry.Hash, err: err})
+				continue
+			}
+			if blob.Size > pointerMaxBytes {
+				continue
+			}
 
-		if parsed, ok := parsePointer(content); ok {
-			if _, duplicate := seenPointers[parsed.oid]; !duplicate {
-				seenPointers[parsed.oid] = struct{}{}
-				*pointers = append(*pointers, parsed)
+			reader, err := blob.Reader()
+			if err != nil {
+				*skipped = append(*skipped, skippedSubtree{name: entry.Name, hash: entry.Hash, err: err})
+				continue
+			}
+			content, err := io.ReadAll(io.LimitReader(reader, pointerMaxBytes))
+			_ = reader.Close()
+			if err != nil {
+				*skipped = append(*skipped, skippedSubtree{name: entry.Name, hash: entry.Hash, err: err})
+				continue
+			}
+
+			if parsed, ok := parsePointer(content); ok {
+				if _, duplicate := seenPointers[parsed.oid]; !duplicate {
+					seenPointers[parsed.oid] = struct{}{}
+					*pointers = append(*pointers, parsed)
+				}
 			}
 		}
 	}
+
+	return nil
 }
 
 // parsePointer parses an LFS pointer file: the version line followed by
