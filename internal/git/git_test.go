@@ -28,18 +28,35 @@ import (
 // exercised without any external binary or network.
 const sourceURL = "http://gitbackup.test/source.git"
 
-var testLoader = &armedLoader{repositories: make(map[string]storer.Storer)}
+// protocolTwoMessage is the error go-git's v0/v1 decoder reports when a host
+// answers with a Git protocol v2 advertisement, built from the same fragments the
+// production check matches so the two cannot drift apart.
+var protocolTwoMessage = fmt.Sprintf("pkt-line 3: %s, %s (version 2)", cannotReadHash, pktLineTooShort)
+
+var testLoader = &armedLoader{
+	repositories: make(map[string]storer.Storer),
+	protocolTwo:  make(map[string]error),
+}
 
 // armedLoader serves the registered repositories but can be told to fail, so
-// tests can exercise the incremental-fetch failure and self-heal paths.
+// tests can exercise the incremental-fetch failure and self-heal paths. It can
+// also answer one endpoint the way a host does when it serves Git protocol v2
+// there: go-git's v0/v1 decoder reports the version announcement as a hash it
+// cannot read.
 type armedLoader struct {
 	repositories map[string]storer.Storer
 	fail         atomic.Bool
+	// protocolTwo maps an endpoint to the error its v2 answer produces, so a
+	// test can serve the modern protocol on one URL form only.
+	protocolTwo map[string]error
 }
 
 func (l *armedLoader) Load(ep *transport.Endpoint) (storer.Storer, error) {
 	if l.fail.Load() {
 		return nil, errors.New("server unavailable")
+	}
+	if err, ok := l.protocolTwo[ep.String()]; ok {
+		return nil, err
 	}
 	repository, ok := l.repositories[ep.String()]
 	if !ok {
@@ -137,6 +154,155 @@ func TestSyncBareRepositoryRejectsUnsupportedTransport(t *testing.T) {
 		if !strings.Contains(err.Error(), "Only http and https clone URLs are allowed") {
 			t.Errorf("SyncBareRepository(%q) error = %v", remoteURL, err)
 		}
+	}
+}
+
+// TestSyncBareRepositoryRetriesTheOtherURLForm covers a host that serves Git
+// protocol v2 at one form of a repository URL while the repository itself is
+// reachable at the other. This client speaks v0/v1 only, so the v2 answer is not
+// something it can read; the same repository at the other form is, so the sync
+// is retried there instead of failing the repository.
+func TestSyncBareRepositoryRetriesTheOtherURLForm(t *testing.T) {
+	const configuredURL = "http://gitbackup.test/protocol-two"
+	const servedURL = configuredURL + ".git"
+
+	source, _ := createSourceRepositoryAt(t, servedURL)
+	head, err := source.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The configured form answers with the modern protocol, which go-git
+	// reports the way v5's decoder does.
+	testLoader.protocolTwo[configuredURL] = errors.New(protocolTwoMessage)
+	t.Cleanup(func() { delete(testLoader.protocolTwo, configuredURL) })
+
+	mirrorPath := filepath.Join(t.TempDir(), "repositories", "mirror")
+	service := NewRepositoryService()
+	if err := service.SyncBareRepository(context.Background(), configuredURL, mirrorPath, nil, false, false); err != nil {
+		t.Fatalf("sync should have retried the other URL form: %v", err)
+	}
+	if !mirrorHasCommit(t, mirrorPath, head.Hash()) {
+		t.Error("mirror should contain the source commit from the form that answers")
+	}
+}
+
+// TestSyncBareRepositoryReportsProtocolTwoWithoutAnAlternate covers a URL with
+// no other form to try: the failure is reported rather than retried into the
+// same answer.
+func TestSyncBareRepositoryReportsProtocolTwoWithoutAnAlternate(t *testing.T) {
+	const configuredURL = "http://gitbackup.test/"
+
+	testLoader.protocolTwo[configuredURL] = errors.New(protocolTwoMessage)
+	t.Cleanup(func() { delete(testLoader.protocolTwo, configuredURL) })
+
+	mirrorPath := filepath.Join(t.TempDir(), "repositories", "mirror")
+	service := NewRepositoryService()
+	err := service.SyncBareRepository(context.Background(), configuredURL, mirrorPath, nil, false, false)
+	if err == nil {
+		t.Fatal("a host that only answers with protocol v2 should be reported")
+	}
+	if !strings.Contains(err.Error(), pktLineTooShort) {
+		t.Errorf("err = %v, want the protocol failure reported", err)
+	}
+}
+
+// TestSyncBareRepositoryRetriesWithoutDestroyingTheMirror covers a cached mirror
+// whose host starts answering with protocol v2. The mirror is intact and the
+// other URL form still serves the repository, so the retry must fetch into the
+// mirror rather than re-cloning: a destructive self-heal would delete a usable
+// mirror and then fail on the same form first, costing a full clone every run.
+func TestSyncBareRepositoryRetriesWithoutDestroyingTheMirror(t *testing.T) {
+	const configuredURL = "http://gitbackup.test/cached-two"
+	const servedURL = configuredURL + ".git"
+
+	createSourceRepositoryAt(t, servedURL)
+	mirrorPath := filepath.Join(t.TempDir(), "repositories", "mirror")
+	service := NewRepositoryService()
+
+	// Seed the cached mirror through the form that answers.
+	if err := service.SyncBareRepository(context.Background(), servedURL, mirrorPath, nil, true, false); err != nil {
+		t.Fatalf("seeding the mirror failed: %v", err)
+	}
+
+	// A file inside the mirror stands in for its contents: re-cloning removes
+	// the directory, so its survival is what separates a fetch from a clone.
+	marker := filepath.Join(mirrorPath, "seeded-marker")
+	if err := os.WriteFile(marker, []byte("seed"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	// The host now answers the configured form with the modern protocol while
+	// the other form still serves the repository.
+	testLoader.protocolTwo[configuredURL] = errors.New(protocolTwoMessage)
+	t.Cleanup(func() { delete(testLoader.protocolTwo, configuredURL) })
+
+	if err := service.SyncBareRepository(context.Background(), configuredURL, mirrorPath, nil, true, false); err != nil {
+		t.Fatalf("sync should have retried the other URL form: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("the cached mirror was rebuilt instead of fetched into: %v", err)
+	}
+	if !isBareRepository(mirrorPath) {
+		t.Error("the cached mirror should still be a bare repository")
+	}
+}
+
+// TestAlternateURLForm covers how the other form of a repository URL is derived.
+func TestAlternateURLForm(t *testing.T) {
+	cases := []struct {
+		name     string
+		remote   string
+		expected string
+	}{
+		{"appends the suffix", "https://host/owner/repo", "https://host/owner/repo.git"},
+		{"removes the suffix", "https://host/owner/repo.git", "https://host/owner/repo"},
+		{"keeps the port", "https://host:8443/owner/repo", "https://host:8443/owner/repo.git"},
+		{"keeps userinfo", "https://user@host/owner/repo", "https://user@host/owner/repo.git"},
+		{"keeps a nested path", "https://host/a/b/c/repo", "https://host/a/b/c/repo.git"},
+		{"no path to alternate", "https://host", ""},
+		{"root path has nothing to alternate", "https://host/", ""},
+		{"only the last suffix is flipped", "https://host/owner/repo.git.git", "https://host/owner/repo.git"},
+		{"keeps a query", "https://host/owner/repo?foo=1", "https://host/owner/repo.git?foo=1"},
+		{"recognises an upper-case suffix", "https://host/owner/repo.GIT", "https://host/owner/repo"},
+		{"drops a trailing slash", "https://host/owner/repo/", "https://host/owner/repo.git"},
+		{"drops a trailing slash after the suffix", "https://host/owner/repo.git/", "https://host/owner/repo"},
+		{"drops a fragment", "https://host/owner/repo#main", "https://host/owner/repo.git"},
+		{"keeps an escaped path escaped", "https://host/owner/re%20po", "https://host/owner/re%20po.git"},
+		{"decodes an escaped separator", "https://host/owner/re%2Fpo", "https://host/owner/re/po.git"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := alternateURLForm(testCase.remote); got != testCase.expected {
+				t.Errorf("alternateURLForm(%q) = %q, want %q", testCase.remote, got, testCase.expected)
+			}
+		})
+	}
+}
+
+// TestVersionTwoAlternate covers the decision to retry: only a protocol v2
+// advertisement leaves anything to try, and only when there is another form.
+func TestVersionTwoAlternate(t *testing.T) {
+	protocolTwo := errors.New(protocolTwoMessage)
+
+	cases := []struct {
+		name     string
+		remote   string
+		err      error
+		expected string
+	}{
+		{"retries the other form", "https://host/owner/repo", protocolTwo, "https://host/owner/repo.git"},
+		{"nothing to retry without a path", "https://host/", protocolTwo, ""},
+		{"a successful sync is not retried", "https://host/owner/repo", nil, ""},
+		{"an unrelated failure is not retried", "https://host/owner/repo", errors.New("connection refused"), ""},
+		{"an authentication failure is not retried", "https://host/owner/repo", transport.ErrAuthenticationRequired, ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := versionTwoAlternate(testCase.remote, testCase.err); got != testCase.expected {
+				t.Errorf("versionTwoAlternate(%q, %v) = %q, want %q", testCase.remote, testCase.err, got, testCase.expected)
+			}
+		})
 	}
 }
 

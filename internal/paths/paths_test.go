@@ -51,6 +51,35 @@ func TestTrimGitSuffix(t *testing.T) {
 	}
 }
 
+func TestRedactURL(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "masks a password", raw: "https://user:token@host/owner/repo", want: "https://user:xxxxx@host/owner/repo"},
+		{name: "masks only the password", raw: "https://user:tok@host:8443/owner/repo.git", want: "https://user:xxxxx@host:8443/owner/repo.git"},
+		{name: "keeps a username", raw: "https://user@host/owner/repo", want: "https://user@host/owner/repo"},
+		{name: "leaves a url without userinfo alone", raw: "https://host/owner/repo", want: "https://host/owner/repo"},
+		{name: "masks a password in a value the parser rejects", raw: "https://user:token@exa mple.com/repo", want: "https://user:xxxxx@exa mple.com/repo"},
+		{name: "masks a password before a bad port", raw: "https://user:token@host:notaport/repo", want: "https://user:xxxxx@host:notaport/repo"},
+		{name: "masks a password with a space in it", raw: "https://user:p@ss word@host/repo", want: "https://user:xxxxx@host/repo"},
+		{name: "masks a password under another scheme", raw: "ssh://user:token@host:22/repo", want: "ssh://user:xxxxx@host:22/repo"},
+		{name: "masks a password containing a slash", raw: "https://user:tok/en@host/repo", want: "https://user:xxxxx@host/repo"},
+		{name: "masks a password containing a question mark", raw: "https://user:tok?en@host/repo", want: "https://user:xxxxx@host/repo"},
+		{name: "masks a password containing a hash", raw: "https://user:tok#en@host/repo", want: "https://user:xxxxx@host/repo"},
+		{name: "leaves a host and port without userinfo alone", raw: "https://host:8080/repo", want: "https://host:8080/repo"},
+		{name: "leaves an unparseable value without userinfo alone", raw: "http://[::1", want: "http://[::1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RedactURL(tt.raw); got != tt.want {
+				t.Errorf("RedactURL(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseHTTPURL(t *testing.T) {
 	ok := []string{"https://example.com/x", "http://10.0.0.1:9000", "HTTPS://EXAMPLE.COM", " https://padded.example.com "}
 	for _, value := range ok {
