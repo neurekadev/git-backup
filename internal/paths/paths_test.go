@@ -51,6 +51,27 @@ func TestTrimGitSuffix(t *testing.T) {
 	}
 }
 
+func TestRedactURL(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "masks a password", raw: "https://user:token@host/owner/repo", want: "https://user:xxxxx@host/owner/repo"},
+		{name: "masks only the password", raw: "https://user:tok@host:8443/owner/repo.git", want: "https://user:xxxxx@host:8443/owner/repo.git"},
+		{name: "keeps a username", raw: "https://user@host/owner/repo", want: "https://user@host/owner/repo"},
+		{name: "leaves a url without userinfo alone", raw: "https://host/owner/repo", want: "https://host/owner/repo"},
+		{name: "returns an unparseable value unchanged", raw: "http://[::1", want: "http://[::1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RedactURL(tt.raw); got != tt.want {
+				t.Errorf("RedactURL(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseHTTPURL(t *testing.T) {
 	ok := []string{"https://example.com/x", "http://10.0.0.1:9000", "HTTPS://EXAMPLE.COM", " https://padded.example.com "}
 	for _, value := range ok {

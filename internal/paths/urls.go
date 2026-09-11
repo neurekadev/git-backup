@@ -44,6 +44,19 @@ func TrimGitSuffix(value string) string {
 	return value
 }
 
+// RedactURL renders a URL with any embedded password masked, for safe inclusion
+// in logs and error messages. A clone URL may carry userinfo such as
+// https://user:token@host/owner/repo, and a token written to a log is a leaked
+// credential. A value that does not parse is returned unchanged, because there
+// is nothing to mask and dropping it would hide the failure being reported.
+func RedactURL(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return rawURL
+	}
+	return parsed.Redacted()
+}
+
 // IsHTTPOrHTTPS reports whether the parsed URL uses the http or https scheme.
 // It is the single predicate behind the transport allowlist, settings
 // validation, and the storage-key parser.

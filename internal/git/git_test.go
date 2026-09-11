@@ -207,6 +207,47 @@ func TestSyncBareRepositoryReportsProtocolTwoWithoutAnAlternate(t *testing.T) {
 	}
 }
 
+// TestSyncBareRepositoryRetriesWithoutDestroyingTheMirror covers a cached mirror
+// whose host starts answering with protocol v2. The mirror is intact and the
+// other URL form still serves the repository, so the retry must fetch into the
+// mirror rather than re-cloning: a destructive self-heal would delete a usable
+// mirror and then fail on the same form first, costing a full clone every run.
+func TestSyncBareRepositoryRetriesWithoutDestroyingTheMirror(t *testing.T) {
+	const configuredURL = "http://gitbackup.test/cached-two"
+	const servedURL = configuredURL + ".git"
+
+	createSourceRepositoryAt(t, servedURL)
+	mirrorPath := filepath.Join(t.TempDir(), "repositories", "mirror")
+	service := NewRepositoryService()
+
+	// Seed the cached mirror through the form that answers.
+	if err := service.SyncBareRepository(context.Background(), servedURL, mirrorPath, nil, true, false); err != nil {
+		t.Fatalf("seeding the mirror failed: %v", err)
+	}
+
+	// A file inside the mirror stands in for its contents: re-cloning removes
+	// the directory, so its survival is what separates a fetch from a clone.
+	marker := filepath.Join(mirrorPath, "seeded-marker")
+	if err := os.WriteFile(marker, []byte("seed"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	// The host now answers the configured form with the modern protocol while
+	// the other form still serves the repository.
+	testLoader.protocolTwo[configuredURL] = errors.New(protocolTwoMessage)
+	t.Cleanup(func() { delete(testLoader.protocolTwo, configuredURL) })
+
+	if err := service.SyncBareRepository(context.Background(), configuredURL, mirrorPath, nil, true, false); err != nil {
+		t.Fatalf("sync should have retried the other URL form: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("the cached mirror was rebuilt instead of fetched into: %v", err)
+	}
+	if !isBareRepository(mirrorPath) {
+		t.Error("the cached mirror should still be a bare repository")
+	}
+}
+
 // TestAlternateURLForm covers how the other form of a repository URL is derived.
 func TestAlternateURLForm(t *testing.T) {
 	cases := []struct {
@@ -223,6 +264,12 @@ func TestAlternateURLForm(t *testing.T) {
 		{"root path has nothing to alternate", "https://host/", ""},
 		{"only the last suffix is flipped", "https://host/owner/repo.git.git", "https://host/owner/repo.git"},
 		{"keeps a query", "https://host/owner/repo?foo=1", "https://host/owner/repo.git?foo=1"},
+		{"recognises an upper-case suffix", "https://host/owner/repo.GIT", "https://host/owner/repo"},
+		{"drops a trailing slash", "https://host/owner/repo/", "https://host/owner/repo.git"},
+		{"drops a trailing slash after the suffix", "https://host/owner/repo.git/", "https://host/owner/repo"},
+		{"drops a fragment", "https://host/owner/repo#main", "https://host/owner/repo.git"},
+		{"keeps an escaped path escaped", "https://host/owner/re%20po", "https://host/owner/re%20po.git"},
+		{"decodes an escaped separator", "https://host/owner/re%2Fpo", "https://host/owner/re/po.git"},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {

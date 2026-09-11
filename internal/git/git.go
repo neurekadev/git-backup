@@ -63,22 +63,28 @@ func (s *RepositoryService) SyncBareRepository(ctx context.Context, remoteURL, l
 		return fmt.Errorf("unsupported repository URL '%s'. Only http and https clone URLs are allowed.", remoteURL)
 	}
 
+	syncedURL := remoteURL
 	err := mirrorRepository(ctx, remoteURL, localPath, credential, cache)
 	// A host may serve the modern protocol on one form of a repository URL and
 	// the older one on the other, and this client cannot read the modern one.
 	// The same repository is then reachable at the other form, so a failure
 	// that is only about the protocol is retried there rather than reported.
+	// The retry becomes the URL the rest of the sync uses, so a host that
+	// serves LFS on the answered form only is not failed after the mirror
+	// succeeded.
 	if alternate := versionTwoAlternate(remoteURL, err); alternate != "" {
 		slog.Info("Remote answered with Git protocol v2, which this client cannot read; retrying the other URL form.",
-			"repository", remoteURL, "retrying", alternate)
-		err = mirrorRepository(ctx, alternate, localPath, credential, cache)
+			"repository", paths.RedactURL(remoteURL), "retrying", paths.RedactURL(alternate))
+		if err = mirrorRepository(ctx, alternate, localPath, credential, cache); err == nil {
+			syncedURL = alternate
+		}
 	}
 	if err != nil {
 		return err
 	}
 
 	if includeLFS {
-		return s.fetchLFS(ctx, remoteURL, localPath, credential)
+		return s.fetchLFS(ctx, syncedURL, localPath, credential)
 	}
 	return nil
 }
@@ -90,10 +96,12 @@ func mirrorRepository(ctx context.Context, remoteURL, localPath string, credenti
 		// force-updates rewritten branches and prune drops refs deleted
 		// upstream, so the mirror tracks the remote exactly.
 		if err := fetchMirror(ctx, remoteURL, localPath, credential); err != nil {
-			if ctx.Err() != nil {
-				// A shutdown is not a corrupt mirror. Re-cloning here would
-				// delete the cached mirror and then fail on the same cancelled
-				// context, leaving nothing behind.
+			if ctx.Err() != nil || isProtocolVersionTwo(err) {
+				// A shutdown or a protocol v2 advertisement is not a corrupt
+				// mirror. Re-cloning would delete a mirror that is intact — and
+				// on the protocol path it would delete the mirror and then fail
+				// on the same form, turning a retry that could have fetched
+				// incrementally into a full clone.
 				return err
 			}
 			slog.Warn("Incremental mirror fetch failed; re-cloning from scratch.",
@@ -144,18 +152,36 @@ func isProtocolVersionTwo(err error) bool {
 
 // alternateURLForm returns remoteURL with its ".git" suffix flipped, or "" when
 // there is no path to flip.
+//
+// The suffix is matched case-insensitively, as the rest of the codebase does, so
+// a URL that already ends in ".GIT" is recognised as suffixed rather than given
+// a second one. A trailing slash is normalised away first, because otherwise it
+// would end up inside the rewritten path. A fragment is dropped: it is a
+// client-side marker that never forms part of what is fetched, and carrying it
+// onto the other form would append it to a request the server never sent one
+// for. A query is kept, since it can be part of what the remote is asked for.
+//
+// The rewrite is driven by the decoded path, so an escaped separator is no
+// longer distinguished from a real one. A repository path containing a literal
+// slash cannot be spelled in a git URL anyway — the separator is structural —
+// so decoding is the more faithful reading of the URL, not a loss.
 func alternateURLForm(remoteURL string) string {
-	parsed, err := url.Parse(remoteURL)
-	if err != nil || parsed.Path == "" || parsed.Path == "/" {
+	parsed, err := url.Parse(strings.TrimSpace(remoteURL))
+	if err != nil {
 		return ""
 	}
 
-	suffix := strings.HasSuffix(parsed.Path, ".git")
-	if suffix {
-		parsed.Path = strings.TrimSuffix(parsed.Path, ".git")
-	} else {
+	withoutSlash := strings.TrimSuffix(parsed.Path, "/")
+	if withoutSlash == "" {
+		return ""
+	}
+
+	parsed.Path = paths.TrimGitSuffix(withoutSlash)
+	if parsed.Path == withoutSlash {
 		parsed.Path += ".git"
 	}
+	parsed.Fragment = ""
+
 	return parsed.String()
 }
 
@@ -171,7 +197,7 @@ func (s *RepositoryService) fetchLFS(ctx context.Context, remoteURL, localPath s
 
 	err := s.lfs.FetchAll(ctx, localPath, remoteURL, username, password)
 	if errors.Is(err, lfs.ErrDisabled) {
-		slog.Info("Skipped Git LFS fetch because it is disabled on the remote.", "repository", remoteURL)
+		slog.Info("Skipped Git LFS fetch because it is disabled on the remote.", "repository", paths.RedactURL(remoteURL))
 		return nil
 	}
 	if err != nil {
