@@ -11,8 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/go-git/go-git/v5"
 	gitconfig "github.com/go-git/go-git/v5/config"
@@ -61,6 +63,28 @@ func (s *RepositoryService) SyncBareRepository(ctx context.Context, remoteURL, l
 		return fmt.Errorf("unsupported repository URL '%s'. Only http and https clone URLs are allowed.", remoteURL)
 	}
 
+	err := mirrorRepository(ctx, remoteURL, localPath, credential, cache)
+	// A host may serve the modern protocol on one form of a repository URL and
+	// the older one on the other, and this client cannot read the modern one.
+	// The same repository is then reachable at the other form, so a failure
+	// that is only about the protocol is retried there rather than reported.
+	if alternate := versionTwoAlternate(remoteURL, err); alternate != "" {
+		slog.Info("Remote answered with Git protocol v2, which this client cannot read; retrying the other URL form.",
+			"repository", remoteURL, "retrying", alternate)
+		err = mirrorRepository(ctx, alternate, localPath, credential, cache)
+	}
+	if err != nil {
+		return err
+	}
+
+	if includeLFS {
+		return s.fetchLFS(ctx, remoteURL, localPath, credential)
+	}
+	return nil
+}
+
+// mirrorRepository clones or updates the mirror at localPath from remoteURL.
+func mirrorRepository(ctx context.Context, remoteURL, localPath string, credential *Credential, cache bool) error {
 	if cache && isBareRepository(localPath) {
 		// Update the existing mirror. The mirror refspec (+refs/*:refs/*)
 		// force-updates rewritten branches and prune drops refs deleted
@@ -76,16 +100,63 @@ func (s *RepositoryService) SyncBareRepository(ctx context.Context, remoteURL, l
 				"localPath", localPath, "error", err.Error())
 			return freshClone(ctx, remoteURL, localPath, credential)
 		}
-	} else {
-		if err := freshClone(ctx, remoteURL, localPath, credential); err != nil {
-			return err
-		}
+		return nil
+	}
+	return freshClone(ctx, remoteURL, localPath, credential)
+}
+
+// pktLineTooShort and cannotReadHash are the two fragments go-git's v0/v1 ref
+// decoder produces when it is handed a protocol v2 advertisement: the version
+// announcement is read as a ref, and "version 2" is too short to be a hash.
+// Both are required so an unrelated decode failure cannot be mistaken for it.
+//
+// The failure is recognised by its text because go-git raises it from deep
+// inside the decoder and wraps it in no error this package can match on; there
+// is no sentinel to compare against.
+const (
+	pktLineTooShort = "pkt-line too short"
+	cannotReadHash  = "cannot read hash"
+)
+
+// versionTwoAlternate returns the other spelling of remoteURL when err says the
+// remote answered with a protocol v2 advertisement, and "" when there is
+// nothing to retry.
+//
+// A host decides whether a repository is served at its bare path or at the path
+// ending in ".git", and some hosts answer one of the two with the modern
+// protocol only. Since go-git v5 cannot read that protocol, the other form is
+// the same repository reached a way this client understands. A URL with no path
+// to alternate has nothing to offer, so it is reported rather than retried.
+func versionTwoAlternate(remoteURL string, err error) string {
+	if err == nil || !isProtocolVersionTwo(err) {
+		return ""
+	}
+	return alternateURLForm(remoteURL)
+}
+
+func isProtocolVersionTwo(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, cannotReadHash) && strings.Contains(message, pktLineTooShort)
+}
+
+// alternateURLForm returns remoteURL with its ".git" suffix flipped, or "" when
+// there is no path to flip.
+func alternateURLForm(remoteURL string) string {
+	parsed, err := url.Parse(remoteURL)
+	if err != nil || parsed.Path == "" || parsed.Path == "/" {
+		return ""
 	}
 
-	if includeLFS {
-		return s.fetchLFS(ctx, remoteURL, localPath, credential)
+	suffix := strings.HasSuffix(parsed.Path, ".git")
+	if suffix {
+		parsed.Path = strings.TrimSuffix(parsed.Path, ".git")
+	} else {
+		parsed.Path += ".git"
 	}
-	return nil
+	return parsed.String()
 }
 
 // fetchLFS mirrors the remote's LFS objects. A remote can have Git LFS turned
