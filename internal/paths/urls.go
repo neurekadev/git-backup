@@ -66,32 +66,34 @@ func RedactURL(rawURL string) string {
 // maskUserinfo replaces the password of a URL's userinfo section, keeping the
 // scheme and username so a log line still says what was fetched and which
 // credential was used. It is applied to values the URL parser rejected, so it
-// locates the section itself rather than asking the parser for it: everything
-// between the scheme and the first separator is the authority, and within that
-// the last "@" splits userinfo from host, because a password may contain one.
+// locates the section itself rather than asking the parser for it.
+//
+// The section runs from the first ":" after the scheme to the last "@" in the
+// remainder: a password may itself contain "@", "/", "?" or "#", so the last
+// "@" is what separates userinfo from the host, and cutting at a separator
+// first would hide that "@" and hand the credential back unchanged. The text
+// after that "@" is kept, since it is the part of the value most likely to
+// identify where the request was going.
 func maskUserinfo(rawURL string) string {
 	schemeEnd := strings.Index(rawURL, "://")
 	if schemeEnd < 0 {
 		return rawURL
 	}
 	prefix := rawURL[:schemeEnd+3]
+	remainder := rawURL[len(prefix):]
 
-	authority := rawURL[len(prefix):]
-	if cut := strings.IndexAny(authority, "/?#"); cut >= 0 {
-		authority = authority[:cut]
-	}
-
-	at := strings.LastIndex(authority, "@")
+	at := strings.LastIndex(remainder, "@")
 	if at < 0 {
+		// No userinfo at all: any ":" belongs to the host and port.
 		return rawURL
 	}
-	colon := strings.Index(authority[:at], ":")
+	colon := strings.Index(remainder[:at], ":")
 	if colon < 0 {
 		// A username with no password carries no secret to mask.
 		return rawURL
 	}
 
-	return prefix + authority[:colon+1] + "xxxxx" + authority[at:]
+	return prefix + remainder[:colon+1] + "xxxxx" + remainder[at:]
 }
 
 // IsHTTPOrHTTPS reports whether the parsed URL uses the http or https scheme.
