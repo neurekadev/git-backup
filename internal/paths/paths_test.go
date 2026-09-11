@@ -61,7 +61,11 @@ func TestRedactURL(t *testing.T) {
 		{name: "masks only the password", raw: "https://user:tok@host:8443/owner/repo.git", want: "https://user:xxxxx@host:8443/owner/repo.git"},
 		{name: "keeps a username", raw: "https://user@host/owner/repo", want: "https://user@host/owner/repo"},
 		{name: "leaves a url without userinfo alone", raw: "https://host/owner/repo", want: "https://host/owner/repo"},
-		{name: "returns an unparseable value unchanged", raw: "http://[::1", want: "http://[::1"},
+		{name: "masks a password in a value the parser rejects", raw: "https://user:token@exa mple.com/repo", want: "https://user:xxxxx@exa mple.com"},
+		{name: "masks a password before a bad port", raw: "https://user:token@host:notaport/repo", want: "https://user:xxxxx@host:notaport"},
+		{name: "masks a password with a space in it", raw: "https://user:p@ss word@host/repo", want: "https://user:xxxxx@host"},
+		{name: "masks a password under another scheme", raw: "ssh://user:token@host:22/repo", want: "ssh://user:xxxxx@host:22/repo"},
+		{name: "leaves an unparseable value without userinfo alone", raw: "http://[::1", want: "http://[::1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

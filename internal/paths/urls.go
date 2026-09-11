@@ -47,14 +47,51 @@ func TrimGitSuffix(value string) string {
 // RedactURL renders a URL with any embedded password masked, for safe inclusion
 // in logs and error messages. A clone URL may carry userinfo such as
 // https://user:token@host/owner/repo, and a token written to a log is a leaked
-// credential. A value that does not parse is returned unchanged, because there
-// is nothing to mask and dropping it would hide the failure being reported.
+// credential.
+//
+// A value the parser rejects is masked textually rather than returned as-is:
+// url.Parse refuses hosts with spaces or malformed ports, and those are exactly
+// the values whose userinfo cannot be isolated by parsing. Failing open there
+// would leak the credential the function exists to hide.
 func RedactURL(rawURL string) string {
-	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	trimmed := strings.TrimSpace(rawURL)
+
+	parsed, err := url.Parse(trimmed)
 	if err != nil {
-		return rawURL
+		return maskUserinfo(trimmed)
 	}
 	return parsed.Redacted()
+}
+
+// maskUserinfo replaces the password of a URL's userinfo section, keeping the
+// scheme and username so a log line still says what was fetched and which
+// credential was used. It is applied to values the URL parser rejected, so it
+// locates the section itself rather than asking the parser for it: everything
+// between the scheme and the first separator is the authority, and within that
+// the last "@" splits userinfo from host, because a password may contain one.
+func maskUserinfo(rawURL string) string {
+	schemeEnd := strings.Index(rawURL, "://")
+	if schemeEnd < 0 {
+		return rawURL
+	}
+	prefix := rawURL[:schemeEnd+3]
+
+	authority := rawURL[len(prefix):]
+	if cut := strings.IndexAny(authority, "/?#"); cut >= 0 {
+		authority = authority[:cut]
+	}
+
+	at := strings.LastIndex(authority, "@")
+	if at < 0 {
+		return rawURL
+	}
+	colon := strings.Index(authority[:at], ":")
+	if colon < 0 {
+		// A username with no password carries no secret to mask.
+		return rawURL
+	}
+
+	return prefix + authority[:colon+1] + "xxxxx" + authority[at:]
 }
 
 // IsHTTPOrHTTPS reports whether the parsed URL uses the http or https scheme.
